@@ -1,0 +1,9 @@
+# Telegram Bot
+python-telegram-bot==21.6
+
+# Google Sheets
+gspread==6.1.4
+google-auth==2.35.0
+
+# Env file loader
+python-dotenv==1.0.1
