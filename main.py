@@ -62,7 +62,8 @@ COL_NAME       = 4    # D  → Name
 COL_PRESENT    = 5    # E  → Present  (formula/count — read-only)
 COL_ABSENT     = 6    # F  → Absent   (formula/count — read-only)
 COL_PERCENTAGE = 7    # G  → Percentage (formula — read-only)
-COL_DATE_START = 8    # H  → First date column (P/A values start here)
+COL_DATE_START  = 8    # H  → First date column (P/A values start here)
+DATE_LABEL_ROW  = 69   # Row where YOU placed the date labels (H69, I69, J69…)
 
 # Google API scopes
 SCOPES = [
@@ -116,78 +117,101 @@ def _open_worksheet() -> gspread.Worksheet:
 
 def lookup_student(reg_no: str, roll_no: str) -> dict:
     """
-    Finds a student row by Reg No and verifies their Roll No.
+    Finds a student row by Reg No + Roll No, then builds the full date-wise log.
 
-    Returns one of:
-      {"status": "found",  "name": ..., "present": ..., "absent": ...,
-       "percentage": ..., "attendance_log": [(date_label, status), ...]}
+    Date labels are read from DATE_LABEL_ROW (row 69: H69, I69, J69…).
+    P/A scanning starts at COL_DATE_START (col H) and stops at the first
+    empty cell in the student’s row, so only recorded classes are shown.
+
+    Returns:
+      {"status": "found",  "name": …, "present": …, "absent": …,
+       "percentage": …, "attendance_log": [(date_label, "P"|"A"|"-"), …]}
       {"status": "reg_not_found"}
       {"status": "roll_mismatch"}
-      {"status": "sheet_error", "detail": ...}
-
-    attendance_log is a list of (date_str, "P" | "A" | "-") tuples
-    from column H onwards where a date header exists.
+      {"status": "sheet_error", "detail": …}
     """
     try:
-        ws = _open_worksheet()
-        all_values = ws.get_all_values()   # single API call — list of lists
+        ws         = _open_worksheet()
+        all_values = ws.get_all_values()   # one API call — list of lists (0-indexed)
 
         reg_no_clean  = reg_no.strip().upper()
         roll_no_clean = roll_no.strip()
 
-        # ── Extract date headers from Row 7 (index 6) ──────────────────────
-        # Date columns start at COL_DATE_START (1-based) = index COL_DATE_START-1
-        header_row  = all_values[HEADER_ROW - 1] if len(all_values) >= HEADER_ROW else []
-        date_headers = []
-        for i, cell in enumerate(header_row[COL_DATE_START - 1:], start=COL_DATE_START):
-            label = cell.strip()
-            if label:   # only keep columns that actually have a date label
-                date_headers.append((i, label))   # (1-based col index, label string)
+        # ── Read date labels from row 69 (H69, I69, J69…) ────────────────
+        # all_values index = DATE_LABEL_ROW - 1
+        if len(all_values) >= DATE_LABEL_ROW:
+            date_label_row = all_values[DATE_LABEL_ROW - 1]
+        else:
+            date_label_row = []
+        logger.info("Date labels row has %d cells.", len(date_label_row))
 
-        # ── Scan data rows ──────────────────────────────────────────────────
+        # ── Find student row ──────────────────────────────────────────────
         data_rows = all_values[DATA_START_ROW - 1:]
 
         for row in data_rows:
-            # Pad row so index lookups never raise IndexError
-            max_col_needed = max(
-                COL_REG, COL_ROLL, COL_NAME,
-                COL_PRESENT, COL_ABSENT, COL_PERCENTAGE,
-                *(col_idx for col_idx, _ in date_headers) if date_headers else [0]
-            )
-            while len(row) < max_col_needed:
+            # Ensure minimum required length for fixed columns
+            needed = max(COL_REG, COL_ROLL, COL_NAME,
+                         COL_PRESENT, COL_ABSENT, COL_PERCENTAGE)
+            while len(row) < needed:
                 row.append("")
 
-            row_reg  = row[COL_REG  - 1].strip().upper()
-            row_name = row[COL_NAME - 1].strip()
-
+            row_reg = row[COL_REG - 1].strip().upper()
             if row_reg != reg_no_clean:
                 continue
 
-            # ── Reg No matched — verify Roll No ────────────────────────────
+            # ── Reg No matched — check Roll No ────────────────────────────
             row_roll = row[COL_ROLL - 1].strip()
             if row_roll != roll_no_clean:
-                logger.info("Roll No mismatch for reg=%s (sheet=%s, input=%s)",
+                logger.info("Roll mismatch reg=%s sheet=%s input=%s",
                             reg_no_clean, row_roll, roll_no_clean)
                 return {"status": "roll_mismatch"}
 
             # ── Both matched — read summary stats ──────────────────────────
+            row_name   = row[COL_NAME       - 1].strip()
             present    = row[COL_PRESENT    - 1].strip() or "0"
             absent     = row[COL_ABSENT     - 1].strip() or "0"
             percentage = row[COL_PERCENTAGE - 1].strip() or "N/A"
 
-            # ── Build date-wise log from H onwards ─────────────────────────
+            # ── Build date-wise log ───────────────────────────────────────
+            # Start at COL_DATE_START (col H, 1-based index 8).
+            # Scan right column by column; stop when the P/A cell is empty
+            # (means that class hasn’t happened yet).
+            # Date label is taken from the same column in DATE_LABEL_ROW (row 69).
             attendance_log = []
-            for col_idx, date_label in date_headers:
-                cell_val = row[col_idx - 1].strip().upper() if col_idx <= len(row) else ""
-                if cell_val in ("P", "PRESENT"):
+            col_idx = COL_DATE_START   # 1-based
+
+            while True:
+                # Safety: don’t read past the end of the student row
+                if col_idx > len(row):
+                    break
+
+                cell_val = row[col_idx - 1].strip()   # P/A value for this class
+                if not cell_val:                       # empty → no more classes
+                    break
+
+                # Get date label from row 69 (same column)
+                if col_idx <= len(date_label_row):
+                    date_label = date_label_row[col_idx - 1].strip()
+                else:
+                    date_label = ""
+
+                # Fallback: show column letter if no label in row 69
+                if not date_label:
+                    # Convert 1-based col to spreadsheet letter (H=8 → "H")
+                    date_label = _col_letter(col_idx)
+
+                upper_val = cell_val.upper()
+                if upper_val in ("P", "PRESENT"):
                     status_char = "P"
-                elif cell_val in ("A", "ABSENT"):
+                elif upper_val in ("A", "ABSENT"):
                     status_char = "A"
                 else:
-                    status_char = "-"   # not recorded / empty
-                attendance_log.append((date_label, status_char))
+                    status_char = "-"
 
-            logger.info("Found student: name=%s reg=%s pct=%s%% dates=%d",
+                attendance_log.append((date_label, status_char))
+                col_idx += 1
+
+            logger.info("Student found: name=%s reg=%s pct=%s dates=%d",
                         row_name, reg_no_clean, percentage, len(attendance_log))
             return {
                 "status":         "found",
@@ -201,11 +225,20 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
         return {"status": "reg_not_found"}
 
     except gspread.exceptions.SpreadsheetNotFound:
-        logger.error("Spreadsheet not found. Check SHEET_ID and sharing permissions.")
+        logger.error("Spreadsheet not found. Check SHEET_ID / sharing.")
         return {"status": "sheet_error", "detail": "Spreadsheet not found."}
     except Exception as exc:
         logger.exception("Sheet lookup failed: %s", exc)
         return {"status": "sheet_error", "detail": str(exc)}
+
+
+def _col_letter(col: int) -> str:
+    """Convert 1-based column number to spreadsheet letter(s). 1→A, 8→H, 27→AA"""
+    result = ""
+    while col > 0:
+        col, rem = divmod(col - 1, 26)
+        result = chr(65 + rem) + result
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
