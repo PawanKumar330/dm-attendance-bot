@@ -433,9 +433,27 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     logger.info("Bot is live. Press Ctrl+C to stop.")
+
+    # ── Delete any active webhook before starting polling ──────────────────
+    # A webhook set by another service causes a 409 Conflict with run_polling.
+    # httpx is already installed as a python-telegram-bot dependency.
+    try:
+        import httpx
+        with httpx.Client(timeout=15) as client:
+            r = client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+                json={"drop_pending_updates": True},
+            )
+            logger.info("deleteWebhook → %s", r.json())
+    except Exception as exc:
+        logger.warning("Could not delete webhook (continuing anyway): %s", exc)
+
     # Fix for Python 3.12+ — asyncio no longer auto-creates an event loop
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,   # discard any queued updates from downtime
+    )
 
 
 if __name__ == "__main__":
