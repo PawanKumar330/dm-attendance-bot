@@ -1,5 +1,5 @@
-"""
-main.py — Discrete Mathematics Attendance Telegram Bot
+"""main.py — Discrete Mathematics Attendance Telegram Bot
+
 ======================================================
 Students can check their own attendance by entering their
 Registration Number and Roll Number via a Telegram bot.
@@ -16,7 +16,7 @@ Conversation flow:
   /cancel → Exit at any point
 
 Run locally  : python main.py
-Deploy Render: Web Service or Background Worker → python main.py
+Deploy Render: Web Service → python main.py
 """
 
 import asyncio
@@ -28,8 +28,8 @@ import sys
 import threading
 
 from dotenv import load_dotenv
-import gspread
 from google.oauth2.service_account import Credentials
+import gspread
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -66,7 +66,7 @@ COL_PRESENT = 5  # E  → Present  (formula/count — read-only)
 COL_ABSENT = 6  # F  → Absent   (formula/count — read-only)
 COL_PERCENTAGE = 7  # G  → Percentage (formula — read-only)
 COL_DATE_START = 8  # H  → First date column (P/A values start here)
-DATE_LABEL_ROW = 69  # Row where YOU placed the date labels (H69, I69, J69…)
+DATE_LABEL_ROW = 69  # Row where date labels are located (H69, I69, J69…)
 
 # Google API scopes
 SCOPES = [
@@ -109,6 +109,11 @@ def start_health_check_server() -> None:
       self.send_header("Content-Type", "text/plain")
       self.end_headers()
       self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+      self.send_response(200)
+      self.send_header("Content-Type", "text/plain")
+      self.end_headers()
 
     def log_message(self, format, *args):
       pass  # Suppress HTTP request logs
@@ -157,32 +162,28 @@ def _open_worksheet() -> gspread.Worksheet:
 def lookup_student(reg_no: str, roll_no: str) -> dict:
   """Finds a student row by Reg No + Roll No, then builds the full date-wise log.
 
-  Date labels are read from DATE_LABEL_ROW (row 69: H69, I69, J69…).
-  P/A scanning starts at COL_DATE_START (col H) and stops at the first
-  empty cell in the student’s row, so only recorded classes are shown.
-
   Returns:
-    {"status": "found",  "name": …, "present": …, "absent": …,
-     "percentage": …, "attendance_log": [(date_label, "P"|"A"|"-"), …]}
-    {"status": "reg_not_found"}
-    {"status": "roll_mismatch"}
-    {"status": "sheet_error", "detail": …}
+      {"status": "found",  "name": …, "present": …, "absent": …,
+       "percentage": …, "attendance_log": [(date_label, "P"|"A"|"-"), …]}
+      {"status": "reg_not_found"}
+      {"status": "roll_mismatch"}
+      {"status": "sheet_error", "detail": …}
   """
   try:
     ws = _open_worksheet()
-    all_values = ws.get_all_values()  # one API call — list of lists (0-indexed)
+    all_values = ws.get_all_values()
 
     reg_no_clean = reg_no.strip().upper()
     roll_no_clean = roll_no.strip()
 
-    # ── Read date labels from row 69 (H69, I69, J69…) ────────────────
+    # Read date labels from row 69
     if len(all_values) >= DATE_LABEL_ROW:
       date_label_row = all_values[DATE_LABEL_ROW - 1]
     else:
       date_label_row = []
     logger.info("Date labels row has %d cells.", len(date_label_row))
 
-    # ── Find student row ──────────────────────────────────────────────
+    # Find student row
     data_rows = all_values[DATA_START_ROW - 1 :]
 
     for row in data_rows:
@@ -201,7 +202,6 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
       if row_reg != reg_no_clean:
         continue
 
-      # ── Reg No matched — check Roll No ────────────────────────────
       row_roll = row[COL_ROLL - 1].strip()
       if row_roll != roll_no_clean:
         logger.info(
@@ -212,22 +212,20 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
         )
         return {"status": "roll_mismatch"}
 
-      # ── Both matched — read summary stats ──────────────────────────
       row_name = row[COL_NAME - 1].strip()
       present = row[COL_PRESENT - 1].strip() or "0"
       absent = row[COL_ABSENT - 1].strip() or "0"
       percentage = row[COL_PERCENTAGE - 1].strip() or "N/A"
 
-      # ── Build date-wise log ───────────────────────────────────────
       attendance_log = []
-      col_idx = COL_DATE_START  # 1-based
+      col_idx = COL_DATE_START
 
       while True:
         if col_idx > len(row):
           break
 
         cell_val = row[col_idx - 1].strip()
-        if not cell_val:  # empty → no more classes
+        if not cell_val:
           break
 
         if col_idx <= len(date_label_row):
@@ -370,7 +368,6 @@ async def received_roll_no(
     percentage = result["percentage"]
     attendance_log = result.get("attendance_log", [])
 
-    # ── Status emoji ───────────────────────────────────────────────────
     try:
       pct_val = float(str(percentage).replace("%", "").strip())
       if pct_val >= 75:
@@ -386,7 +383,6 @@ async def received_roll_no(
       pct_emoji = "📊"
       status_text = ""
 
-    # ── Message 1: Summary card ────────────────────────────────────────
     await update.message.reply_text(
         f"📋 *Attendance Record — Discrete Mathematics*\n"
         f"{'─' * 34}\n"
@@ -402,7 +398,6 @@ async def received_roll_no(
         parse_mode="Markdown",
     )
 
-    # ── Message 2: Date-wise log ───────────────────────────────────────
     if attendance_log:
       lines = ["📅 *Date-wise Attendance Log:*\n"]
       for i, (date_label, status_char) in enumerate(attendance_log, start=1):
@@ -509,8 +504,6 @@ def main() -> None:
       drop_pending_updates=True,
   )
 
-@app.route('/health')
-def health():
-    return 'OK', 200
+
 if __name__ == "__main__":
   main()
