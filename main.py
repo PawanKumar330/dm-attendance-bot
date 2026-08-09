@@ -224,4 +224,4 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
         if col_idx > len(row):
           break
 
-        cell_val = row[col_idx - 1].
+        cell_val = row[col_idx - 1]
