@@ -66,7 +66,7 @@ COL_PRESENT = 5  # E  → Present  (formula/count — read-only)
 COL_ABSENT = 6  # F  → Absent   (formula/count — read-only)
 COL_PERCENTAGE = 7  # G  → Percentage (formula — read-only)
 COL_DATE_START = 8  # H  → First date column (P/A values start here)
-DATE_LABEL_ROW = 104  # Row where date labels are located (H104, I104, J104…)
+DATE_LABEL_ROW = 105  # Row where date labels are located (H105, I105, J105…)
 
 # Google API scopes
 SCOPES = [
@@ -176,7 +176,7 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
     reg_no_clean = reg_no.strip().upper()
     roll_no_clean = roll_no.strip()
 
-    # Read date labels from row 104
+    # Read date labels from row 105
     if len(all_values) >= DATE_LABEL_ROW:
       date_label_row = all_values[DATE_LABEL_ROW - 1]
     else:
