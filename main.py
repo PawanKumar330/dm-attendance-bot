@@ -174,21 +174,32 @@ def save_user_record(
 
 
 def get_all_user_chat_ids() -> list[int]:
-  """Retrieves unique user Chat IDs from the private USERS_SHEET_ID spreadsheet."""
+  """Retrieves all unique user Chat IDs from the private USERS_SHEET_ID spreadsheet."""
   try:
     client = gspread.authorize(_build_creds())
     spreadsheet = client.open_by_key(USERS_SHEET_ID.strip())
     ws_users = spreadsheet.sheet1
     all_rows = ws_users.get_all_values()
+    logger.info("Fetched %d rows from Users sheet.", len(all_rows))
     chat_ids = []
 
-    for row in all_rows[1:]:
-      if row and row[0].strip().isdigit():
-        chat_ids.append(int(row[0].strip()))
+    for row in all_rows:
+      if not row:
+        continue
+      # Clean single quotes or spaces from Google Sheets text formatting
+      val = row[0].strip().lstrip("'")
+      try:
+        cid = int(val)
+        chat_ids.append(cid)
+      except ValueError:
+        continue  # Skip header row or non-numeric cells
 
+    logger.info("Found %d valid Chat ID(s) for broadcast.", len(chat_ids))
     return list(set(chat_ids))
   except Exception as exc:
-    logger.error("Failed to fetch user chat IDs: %s", exc)
+    logger.error(
+        "Failed to fetch user chat IDs from %s: %s", USERS_SHEET_ID, exc
+    )
     return []
 
 
