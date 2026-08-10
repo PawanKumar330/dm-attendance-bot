@@ -1,25 +1,13 @@
 """
 main.py — Discrete Mathematics Attendance Telegram Bot
 ======================================================
-Students can check their own attendance by entering their
-Registration Number and Roll Number via a Telegram bot.
-
-Sheet structure (Discrete Mathematics):
-  Rows 1–6  : Empty / title area
-  Row  7    : Headers → A=S.NO, B=Roll No, C=Reg No, D=Name,
-                        E=Present, F=Absent, G=Percentage,
-                        H=DOB (or date start)
-  Row  8+   : Student data
-
-Conversation flow:
-  /start  → Ask Reg No → Ask Roll No → Show result
-  /cancel → Exit at any point
-
-Run locally  : python main.py
-Deploy Render: Web Service → python main.py
+Secure dual Google Sheets architecture:
+- SHEET_ID: Public attendance sheet (date labels row 105)
+- USERS_SHEET_ID: Private sheet for storing user Chat IDs for broadcasting
 """
 
 import asyncio
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import logging
@@ -49,26 +37,28 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 SHEET_ID = os.environ.get(
     "SHEET_ID", "1f2XM7HFk0IYSiOyKYEKkNMd3j-lB6NgLS0qlh5M3o0M"
 )
+USERS_SHEET_ID = os.environ.get(
+    "USERS_SHEET_ID", "1lr27rxF3KZqdeXg8cuaLYeL0nTUjREIiecXA8cNXdMA"
+)
 GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_CREDS_PATH", "credentials.json")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Sheet layout constants  (must match your actual Google Sheet)
+# 2. Sheet layout constants
 # ─────────────────────────────────────────────────────────────────────────────
-HEADER_ROW = 7  # Row number that contains column labels
-DATA_START_ROW = 8  # First row with actual student data
+HEADER_ROW = 7
+DATA_START_ROW = 8
 
-# 1-based column positions for fixed columns
 COL_ROLL = 2  # B  → Roll No
 COL_REG = 3  # C  → Reg No
 COL_NAME = 4  # D  → Name
-COL_PRESENT = 5  # E  → Present  (formula/count — read-only)
-COL_ABSENT = 6  # F  → Absent   (formula/count — read-only)
-COL_PERCENTAGE = 7  # G  → Percentage (formula — read-only)
-COL_DATE_START = 8  # H  → First date column (P/A values start here)
-DATE_LABEL_ROW = 105  # Row where date labels are located (H105, I105, J105…)
+COL_PRESENT = 5  # E  → Present
+COL_ABSENT = 6  # F  → Absent
+COL_PERCENTAGE = 7  # G  → Percentage
+COL_DATE_START = 8  # H  → First date column
+DATE_LABEL_ROW = 105  # Row where date labels are located
 
-# Google API scopes
 SCOPES = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/spreadsheets",
@@ -85,17 +75,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dm_bot")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Conversation states
-# ─────────────────────────────────────────────────────────────────────────────
 ASK_REG_NO, ASK_ROLL_NO = range(2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Render Health Check HTTP Server (binds to PORT to pass port scanning)
+# 4. Render Health Check HTTP Server
 # ─────────────────────────────────────────────────────────────────────────────
 def start_health_check_server() -> None:
-  """Starts a lightweight HTTP server on $PORT to satisfy Render Web Service health checks."""
+  """Starts a lightweight HTTP server on $PORT for Render health checks."""
   port_env = os.environ.get("PORT", "10000").strip()
   try:
     port = int(port_env)
@@ -116,7 +103,7 @@ def start_health_check_server() -> None:
       self.end_headers()
 
     def log_message(self, format, *args):
-      pass  # Suppress HTTP request logs
+      pass
 
   try:
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
@@ -128,15 +115,11 @@ def start_health_check_server() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Google Sheets helpers
+# 5. Google Sheets & User Logging Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def _build_creds() -> Credentials:
-  """Build Google credentials from either an env-var JSON string (Render)
-
-  or a local JSON file path (local development).
-  """
   if GOOGLE_CREDS_JSON.strip():
     info = json.loads(GOOGLE_CREDS_JSON.strip())
     return Credentials.from_service_account_info(info, scopes=SCOPES)
@@ -144,31 +127,72 @@ def _build_creds() -> Credentials:
     return Credentials.from_service_account_file(
         GOOGLE_CREDS_PATH.strip(), scopes=SCOPES
     )
-  raise RuntimeError(
-      "No Google credentials found. Set GOOGLE_CREDENTIALS_JSON or"
-      " GOOGLE_CREDS_PATH."
-  )
+  raise RuntimeError("No Google credentials found.")
 
 
 def _open_worksheet() -> gspread.Worksheet:
-  """Opens the Discrete Mathematics spreadsheet, first worksheet."""
   client = gspread.authorize(_build_creds())
   spreadsheet = client.open_by_key(SHEET_ID.strip())
-  worksheet = spreadsheet.sheet1  # gid=0, first tab
+  worksheet = spreadsheet.sheet1
   logger.info("Opened worksheet '%s'.", worksheet.title)
   return worksheet
 
 
-def lookup_student(reg_no: str, roll_no: str) -> dict:
-  """Finds a student row by Reg No + Roll No, then builds the full date-wise log.
+def save_user_record(
+    chat_id: int, username: str, reg_no: str, name: str
+) -> None:
+  """Saves student Chat ID into the private USERS_SHEET_ID spreadsheet."""
+  try:
+    client = gspread.authorize(_build_creds())
+    spreadsheet = client.open_by_key(USERS_SHEET_ID.strip())
+    ws_users = spreadsheet.sheet1
+    all_rows = ws_users.get_all_values()
 
-  Returns:
-      {"status": "found",  "name": …, "present": …, "absent": …,
-       "percentage": …, "attendance_log": [(date_label, "P"|"A"|"-"), …]}
-      {"status": "reg_not_found"}
-      {"status": "roll_mismatch"}
-      {"status": "sheet_error", "detail": …}
-  """
+    if not all_rows:
+      ws_users.append_row(
+          ["Chat ID", "Username", "Reg No", "Name", "Last Active"]
+      )
+      all_rows = ws_users.get_all_values()
+
+    chat_id_str = str(chat_id)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for row in all_rows[1:]:
+      if row and row[0].strip() == chat_id_str:
+        return
+
+    ws_users.append_row([
+        chat_id_str,
+        f"@{username}" if username else "",
+        reg_no,
+        name,
+        now_str,
+    ])
+    logger.info("Saved user record to private Users sheet: %s", chat_id_str)
+  except Exception as exc:
+    logger.error("Failed to save user record: %s", exc)
+
+
+def get_all_user_chat_ids() -> list[int]:
+  """Retrieves unique user Chat IDs from the private USERS_SHEET_ID spreadsheet."""
+  try:
+    client = gspread.authorize(_build_creds())
+    spreadsheet = client.open_by_key(USERS_SHEET_ID.strip())
+    ws_users = spreadsheet.sheet1
+    all_rows = ws_users.get_all_values()
+    chat_ids = []
+
+    for row in all_rows[1:]:
+      if row and row[0].strip().isdigit():
+        chat_ids.append(int(row[0].strip()))
+
+    return list(set(chat_ids))
+  except Exception as exc:
+    logger.error("Failed to fetch user chat IDs: %s", exc)
+    return []
+
+
+def lookup_student(reg_no: str, roll_no: str) -> dict:
   try:
     ws = _open_worksheet()
     all_values = ws.get_all_values()
@@ -176,14 +200,11 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
     reg_no_clean = reg_no.strip().upper()
     roll_no_clean = roll_no.strip()
 
-    # Read date labels from row 105
     if len(all_values) >= DATE_LABEL_ROW:
       date_label_row = all_values[DATE_LABEL_ROW - 1]
     else:
       date_label_row = []
-    logger.info("Date labels row has %d cells.", len(date_label_row))
 
-    # Find student row
     data_rows = all_values[DATA_START_ROW - 1 :]
 
     for row in data_rows:
@@ -204,12 +225,6 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
 
       row_roll = row[COL_ROLL - 1].strip()
       if row_roll != roll_no_clean:
-        logger.info(
-            "Roll mismatch reg=%s sheet=%s input=%s",
-            reg_no_clean,
-            row_roll,
-            roll_no_clean,
-        )
         return {"status": "roll_mismatch"}
 
       row_name = row[COL_NAME - 1].strip()
@@ -247,13 +262,6 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
         attendance_log.append((date_label, status_char))
         col_idx += 1
 
-      logger.info(
-          "Student found: name=%s reg=%s pct=%s dates=%d",
-          row_name,
-          reg_no_clean,
-          percentage,
-          len(attendance_log),
-      )
       return {
           "status": "found",
           "name": row_name,
@@ -265,16 +273,12 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
 
     return {"status": "reg_not_found"}
 
-  except gspread.exceptions.SpreadsheetNotFound:
-    logger.error("Spreadsheet not found. Check SHEET_ID / sharing.")
-    return {"status": "sheet_error", "detail": "Spreadsheet not found."}
   except Exception as exc:
     logger.exception("Sheet lookup failed: %s", exc)
     return {"status": "sheet_error", "detail": str(exc)}
 
 
 def _col_letter(col: int) -> str:
-  """Convert 1-based column number to spreadsheet letter(s). 1→A, 8→H, 27→AA"""
   result = ""
   while col > 0:
     col, rem = divmod(col - 1, 26)
@@ -283,12 +287,11 @@ def _col_letter(col: int) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Telegram conversation handlers
+# 6. Telegram Conversation & Broadcast Handlers
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-  """/start — entry point of the conversation."""
   await update.message.reply_text(
       "👋 *Welcome to the Discrete Mathematics Attendance Bot!*\n\n"
       "I will tell you your attendance percentage.\n\n"
@@ -302,9 +305,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def received_reg_no(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-  """Step 1 — store Reg No and ask for Roll No."""
   reg_no = update.message.text.strip()
-
   if not reg_no:
     await update.message.reply_text(
         "⚠️ Registration number cannot be empty.\nPlease enter it again:"
@@ -312,7 +313,6 @@ async def received_reg_no(
     return ASK_REG_NO
 
   context.user_data["reg_no"] = reg_no
-
   await update.message.reply_text(
       f"✅ Got it!  Reg No: `{reg_no}`\n\n"
       "🔢 Now enter your *Roll Number:*\n"
@@ -325,7 +325,6 @@ async def received_reg_no(
 async def received_roll_no(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-  """Step 2 — verify Roll No and return attendance."""
   roll_no = update.message.text.strip()
   reg_no = context.user_data.get("reg_no", "")
 
@@ -336,37 +335,38 @@ async def received_roll_no(
     return ASK_ROLL_NO
 
   await update.message.reply_text("🔍 Fetching your attendance record…")
-
   result = lookup_student(reg_no, roll_no)
   status = result.get("status")
 
   if status == "reg_not_found":
     await update.message.reply_text(
-        "❌ *Registration number not found.*\n\n"
-        "Please check your Reg No and try again with /start.",
+        "❌ *Registration number not found.*\nPlease check your Reg No and"
+        " try again with /start.",
         parse_mode="Markdown",
     )
-
   elif status == "roll_mismatch":
     await update.message.reply_text(
-        "❌ *Roll Number does not match our records.*\n\n"
-        "Please check your Roll No and try again with /start.",
+        "❌ *Roll Number does not match our records.*\nPlease check your Roll"
+        " No and try again with /start.",
         parse_mode="Markdown",
     )
-
   elif status == "sheet_error":
     await update.message.reply_text(
-        "⚠️ *Could not reach the attendance sheet right now.*\n"
-        "Please try again in a moment.",
+        "⚠️ *Could not reach the attendance sheet right now.*\nPlease try again"
+        " in a moment.",
         parse_mode="Markdown",
     )
-
   else:
     name = result["name"]
     present = result["present"]
     absent = result["absent"]
     percentage = result["percentage"]
     attendance_log = result.get("attendance_log", [])
+
+    # Save user record for broadcasting
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username or ""
+    save_user_record(chat_id, username, reg_no, name)
 
     try:
       pct_val = float(str(percentage).replace("%", "").strip())
@@ -420,11 +420,6 @@ async def received_roll_no(
           chunk = candidate
       if chunk.strip():
         await update.message.reply_text(chunk, parse_mode="Markdown")
-    else:
-      await update.message.reply_text(
-          "_No date-wise records found in the sheet yet._",
-          parse_mode="Markdown",
-      )
 
   context.user_data.clear()
   return ConversationHandler.END
@@ -433,7 +428,6 @@ async def received_roll_no(
 async def cmd_cancel(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-  """/cancel — exits the conversation cleanly."""
   context.user_data.clear()
   await update.message.reply_text(
       "🚫 Cancelled. Type /start anytime to check your attendance."
@@ -441,8 +435,58 @@ async def cmd_cancel(
   return ConversationHandler.END
 
 
+async def cmd_broadcast(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+  """Admin Command: /broadcast <message>"""
+  user_id = update.effective_user.id
+  if not ADMIN_ID or str(user_id) != ADMIN_ID:
+    await update.message.reply_text(
+        "⛔ You are not authorized to use this command."
+    )
+    return
+
+  if not context.args:
+    await update.message.reply_text(
+        "⚠️ Usage: `/broadcast <your message text>`", parse_mode="Markdown"
+    )
+    return
+
+  message_text = " ".join(context.args)
+  chat_ids = get_all_user_chat_ids()
+
+  if not chat_ids:
+    await update.message.reply_text(
+        "⚠️ No user records found in the database."
+    )
+    return
+
+  await update.message.reply_text(
+      f"📢 Starting broadcast to {len(chat_ids)} user(s)…"
+  )
+  success_count = 0
+  fail_count = 0
+
+  for cid in chat_ids:
+    try:
+      await context.bot.send_message(
+          chat_id=cid, text=message_text, parse_mode="Markdown"
+      )
+      success_count += 1
+      await asyncio.sleep(0.05)
+    except Exception as exc:
+      logger.warning("Failed to send broadcast to %s: %s", cid, exc)
+      fail_count += 1
+
+  await update.message.reply_text(
+      f"✅ *Broadcast Complete!*\n\n"
+      f"📤 Sent: `{success_count}`\n"
+      f"❌ Failed / Blocked: `{fail_count}`",
+      parse_mode="Markdown",
+  )
+
+
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-  """Handles messages/commands sent outside of any conversation."""
   await update.message.reply_text(
       "🤖 Type /start to check your attendance.\n"
       "Type /cancel to stop at any time."
@@ -450,7 +494,7 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Application entry point
+# 7. Application Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -460,8 +504,6 @@ def main() -> None:
     sys.exit(1)
 
   logger.info("Starting Discrete Mathematics Attendance Bot…")
-
-  # Start HTTP server in daemon thread to satisfy Render port health checks
   start_health_check_server()
 
   app = Application.builder().token(BOT_TOKEN).build()
@@ -481,11 +523,11 @@ def main() -> None:
   )
 
   app.add_handler(conv)
+  app.add_handler(CommandHandler("broadcast", cmd_broadcast))
   app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
   logger.info("Bot is live. Press Ctrl+C to stop.")
 
-  # Clear webhooks before polling
   try:
     import httpx
 
