@@ -569,6 +569,13 @@ def main() -> None:
   logger.info("Bot is live and listening for messages...")
   sys.stdout.flush()
 
+  # Ensure an active event loop exists for Python 3.12+ / 3.14 compatibility
+  try:
+    asyncio.get_event_loop()
+  except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
   app.run_polling(
       allowed_updates=Update.ALL_TYPES,
       drop_pending_updates=True,
