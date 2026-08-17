@@ -1,5 +1,5 @@
-"""
-main.py — Discrete Mathematics Attendance Telegram Bot
+"""main.py — Discrete Mathematics Attendance Telegram Bot
+
 ======================================================
 Secure dual Google Sheets architecture:
 - SHEET_ID: Public attendance sheet (date labels row 105)
@@ -186,13 +186,12 @@ def get_all_user_chat_ids() -> list[int]:
     for row in all_rows:
       if not row:
         continue
-      # Clean single quotes or spaces from Google Sheets text formatting
       val = row[0].strip().lstrip("'")
       try:
         cid = int(val)
         chat_ids.append(cid)
       except ValueError:
-        continue  # Skip header row or non-numeric cells
+        continue
 
     logger.info("Found %d valid Chat ID(s) for broadcast.", len(chat_ids))
     return list(set(chat_ids))
@@ -211,10 +210,21 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
     reg_no_clean = reg_no.strip().upper()
     roll_no_clean = roll_no.strip()
 
-    if len(all_values) >= DATE_LABEL_ROW:
+    # Retrieve date header row (row 105 with fallback to row 7)
+    date_label_row = []
+    if len(all_values) >= DATE_LABEL_ROW and any(
+        x.strip() for x in all_values[DATE_LABEL_ROW - 1][COL_DATE_START - 1 :]
+    ):
       date_label_row = all_values[DATE_LABEL_ROW - 1]
-    else:
-      date_label_row = []
+    elif len(all_values) >= HEADER_ROW:
+      date_label_row = all_values[HEADER_ROW - 1]
+
+    # Find the last valid date column index
+    last_date_col = COL_DATE_START - 1
+    if date_label_row:
+      for c in range(COL_DATE_START, len(date_label_row) + 1):
+        if date_label_row[c - 1].strip():
+          last_date_col = c
 
     data_rows = all_values[DATA_START_ROW - 1 :]
 
@@ -243,35 +253,35 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
       absent = row[COL_ABSENT - 1].strip() or "0"
       percentage = row[COL_PERCENTAGE - 1].strip() or "N/A"
 
+      effective_last_col = last_date_col
+      if effective_last_col < COL_DATE_START:
+        for c in range(len(row), COL_DATE_START - 1, -1):
+          if row[c - 1].strip():
+            effective_last_col = c
+            break
+
       attendance_log = []
-      col_idx = COL_DATE_START
+      if effective_last_col >= COL_DATE_START:
+        for col_idx in range(COL_DATE_START, effective_last_col + 1):
+          if col_idx <= len(date_label_row):
+            date_label = date_label_row[col_idx - 1].strip()
+          else:
+            date_label = ""
 
-      while True:
-        if col_idx > len(row):
-          break
+          if not date_label:
+            date_label = _col_letter(col_idx)
 
-        cell_val = row[col_idx - 1].strip()
-        if not cell_val:
-          break
+          cell_val = row[col_idx - 1].strip() if col_idx <= len(row) else ""
+          upper_val = cell_val.upper()
 
-        if col_idx <= len(date_label_row):
-          date_label = date_label_row[col_idx - 1].strip()
-        else:
-          date_label = ""
+          if upper_val in ("P", "PRESENT", "1"):
+            status_char = "P"
+          elif upper_val in ("A", "ABSENT", "0"):
+            status_char = "A"
+          else:
+            status_char = "-"
 
-        if not date_label:
-          date_label = _col_letter(col_idx)
-
-        upper_val = cell_val.upper()
-        if upper_val in ("P", "PRESENT"):
-          status_char = "P"
-        elif upper_val in ("A", "ABSENT"):
-          status_char = "A"
-        else:
-          status_char = "-"
-
-        attendance_log.append((date_label, status_char))
-        col_idx += 1
+          attendance_log.append((date_label, status_char))
 
       return {
           "status": "found",
@@ -463,100 +473,4 @@ async def cmd_broadcast(
     )
     return
 
-  message_text = " ".join(context.args)
-  chat_ids = get_all_user_chat_ids()
-
-  if not chat_ids:
-    await update.message.reply_text(
-        "⚠️ No user records found in the database."
-    )
-    return
-
-  await update.message.reply_text(
-      f"📢 Starting broadcast to {len(chat_ids)} user(s)…"
-  )
-  success_count = 0
-  fail_count = 0
-
-  for cid in chat_ids:
-    try:
-      await context.bot.send_message(
-          chat_id=cid, text=message_text, parse_mode="Markdown"
-      )
-      success_count += 1
-      await asyncio.sleep(0.05)
-    except Exception as exc:
-      logger.warning("Failed to send broadcast to %s: %s", cid, exc)
-      fail_count += 1
-
-  await update.message.reply_text(
-      f"✅ *Broadcast Complete!*\n\n"
-      f"📤 Sent: `{success_count}`\n"
-      f"❌ Failed / Blocked: `{fail_count}`",
-      parse_mode="Markdown",
-  )
-
-
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-  await update.message.reply_text(
-      "🤖 Type /start to check your attendance.\n"
-      "Type /cancel to stop at any time."
-  )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. Application Entry Point
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def main() -> None:
-  if not BOT_TOKEN:
-    logger.error("BOT_TOKEN is not set in .env")
-    sys.exit(1)
-
-  logger.info("Starting Discrete Mathematics Attendance Bot…")
-  start_health_check_server()
-
-  app = Application.builder().token(BOT_TOKEN).build()
-
-  conv = ConversationHandler(
-      entry_points=[CommandHandler("start", cmd_start)],
-      states={
-          ASK_REG_NO: [
-              MessageHandler(filters.TEXT & ~filters.COMMAND, received_reg_no)
-          ],
-          ASK_ROLL_NO: [
-              MessageHandler(filters.TEXT & ~filters.COMMAND, received_roll_no)
-          ],
-      },
-      fallbacks=[CommandHandler("cancel", cmd_cancel)],
-      allow_reentry=True,
-  )
-
-  app.add_handler(conv)
-  app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-  app.add_handler(MessageHandler(filters.COMMAND, unknown))
-
-  logger.info("Bot is live. Press Ctrl+C to stop.")
-
-  try:
-    import httpx
-
-    with httpx.Client(timeout=15) as client:
-      r = client.post(
-          f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-          json={"drop_pending_updates": True},
-      )
-      logger.info("deleteWebhook → %s", r.json())
-  except Exception as exc:
-    logger.warning("Could not delete webhook: %s", exc)
-
-  asyncio.set_event_loop(asyncio.new_event_loop())
-  app.run_polling(
-      allowed_updates=Update.ALL_TYPES,
-      drop_pending_updates=True,
-  )
-
-
-if __name__ == "__main__":
-  main()
+  message
