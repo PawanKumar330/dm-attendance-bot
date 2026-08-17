@@ -18,6 +18,7 @@ import threading
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 import gspread
+import httpx
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -33,15 +34,15 @@ from telegram.ext import (
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 SHEET_ID = os.environ.get(
     "SHEET_ID", "1f2XM7HFk0IYSiOyKYEKkNMd3j-lB6NgLS0qlh5M3o0M"
-)
+).strip()
 USERS_SHEET_ID = os.environ.get(
     "USERS_SHEET_ID", "1lr27rxF3KZqdeXg8cuaLYeL0nTUjREIiecXA8cNXdMA"
-)
-GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_CREDS_PATH", "credentials.json")
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+).strip()
+GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_CREDS_PATH", "credentials.json").strip()
+GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
 ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,22 +118,20 @@ def start_health_check_server() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Google Sheets & User Logging Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-
 def _build_creds() -> Credentials:
-  if GOOGLE_CREDS_JSON.strip():
-    info = json.loads(GOOGLE_CREDS_JSON.strip())
+  if GOOGLE_CREDS_JSON:
+    info = json.loads(GOOGLE_CREDS_JSON)
     return Credentials.from_service_account_info(info, scopes=SCOPES)
-  if GOOGLE_CREDS_PATH.strip() and os.path.exists(GOOGLE_CREDS_PATH.strip()):
+  if GOOGLE_CREDS_PATH and os.path.exists(GOOGLE_CREDS_PATH):
     return Credentials.from_service_account_file(
-        GOOGLE_CREDS_PATH.strip(), scopes=SCOPES
+        GOOGLE_CREDS_PATH, scopes=SCOPES
     )
   raise RuntimeError("No Google credentials found.")
 
 
 def _open_worksheet() -> gspread.Worksheet:
   client = gspread.authorize(_build_creds())
-  spreadsheet = client.open_by_key(SHEET_ID.strip())
+  spreadsheet = client.open_by_key(SHEET_ID)
   worksheet = spreadsheet.sheet1
   logger.info("Opened worksheet '%s'.", worksheet.title)
   return worksheet
@@ -144,7 +143,7 @@ def save_user_record(
   """Saves student Chat ID into the private USERS_SHEET_ID spreadsheet."""
   try:
     client = gspread.authorize(_build_creds())
-    spreadsheet = client.open_by_key(USERS_SHEET_ID.strip())
+    spreadsheet = client.open_by_key(USERS_SHEET_ID)
     ws_users = spreadsheet.sheet1
     all_rows = ws_users.get_all_values()
 
@@ -168,309 +167,4 @@ def save_user_record(
         name,
         now_str,
     ])
-    logger.info("Saved user record to private Users sheet: %s", chat_id_str)
-  except Exception as exc:
-    logger.error("Failed to save user record: %s", exc)
-
-
-def get_all_user_chat_ids() -> list[int]:
-  """Retrieves all unique user Chat IDs from the private USERS_SHEET_ID spreadsheet."""
-  try:
-    client = gspread.authorize(_build_creds())
-    spreadsheet = client.open_by_key(USERS_SHEET_ID.strip())
-    ws_users = spreadsheet.sheet1
-    all_rows = ws_users.get_all_values()
-    logger.info("Fetched %d rows from Users sheet.", len(all_rows))
-    chat_ids = []
-
-    for row in all_rows:
-      if not row:
-        continue
-      val = row[0].strip().lstrip("'")
-      try:
-        cid = int(val)
-        chat_ids.append(cid)
-      except ValueError:
-        continue
-
-    logger.info("Found %d valid Chat ID(s) for broadcast.", len(chat_ids))
-    return list(set(chat_ids))
-  except Exception as exc:
-    logger.error(
-        "Failed to fetch user chat IDs from %s: %s", USERS_SHEET_ID, exc
-    )
-    return []
-
-
-def lookup_student(reg_no: str, roll_no: str) -> dict:
-  try:
-    ws = _open_worksheet()
-    all_values = ws.get_all_values()
-
-    reg_no_clean = reg_no.strip().upper()
-    roll_no_clean = roll_no.strip()
-
-    # Retrieve date header row (row 105 with fallback to row 7)
-    date_label_row = []
-    if len(all_values) >= DATE_LABEL_ROW and any(
-        x.strip() for x in all_values[DATE_LABEL_ROW - 1][COL_DATE_START - 1 :]
-    ):
-      date_label_row = all_values[DATE_LABEL_ROW - 1]
-    elif len(all_values) >= HEADER_ROW:
-      date_label_row = all_values[HEADER_ROW - 1]
-
-    # Find the last valid date column index
-    last_date_col = COL_DATE_START - 1
-    if date_label_row:
-      for c in range(COL_DATE_START, len(date_label_row) + 1):
-        if date_label_row[c - 1].strip():
-          last_date_col = c
-
-    data_rows = all_values[DATA_START_ROW - 1 :]
-
-    for row in data_rows:
-      needed = max(
-          COL_REG,
-          COL_ROLL,
-          COL_NAME,
-          COL_PRESENT,
-          COL_ABSENT,
-          COL_PERCENTAGE,
-      )
-      while len(row) < needed:
-        row.append("")
-
-      row_reg = row[COL_REG - 1].strip().upper()
-      if row_reg != reg_no_clean:
-        continue
-
-      row_roll = row[COL_ROLL - 1].strip()
-      if row_roll != roll_no_clean:
-        return {"status": "roll_mismatch"}
-
-      row_name = row[COL_NAME - 1].strip()
-      present = row[COL_PRESENT - 1].strip() or "0"
-      absent = row[COL_ABSENT - 1].strip() or "0"
-      percentage = row[COL_PERCENTAGE - 1].strip() or "N/A"
-
-      effective_last_col = last_date_col
-      if effective_last_col < COL_DATE_START:
-        for c in range(len(row), COL_DATE_START - 1, -1):
-          if row[c - 1].strip():
-            effective_last_col = c
-            break
-
-      attendance_log = []
-      if effective_last_col >= COL_DATE_START:
-        for col_idx in range(COL_DATE_START, effective_last_col + 1):
-          if col_idx <= len(date_label_row):
-            date_label = date_label_row[col_idx - 1].strip()
-          else:
-            date_label = ""
-
-          if not date_label:
-            date_label = _col_letter(col_idx)
-
-          cell_val = row[col_idx - 1].strip() if col_idx <= len(row) else ""
-          upper_val = cell_val.upper()
-
-          if upper_val in ("P", "PRESENT", "1"):
-            status_char = "P"
-          elif upper_val in ("A", "ABSENT", "0"):
-            status_char = "A"
-          else:
-            status_char = "-"
-
-          attendance_log.append((date_label, status_char))
-
-      return {
-          "status": "found",
-          "name": row_name,
-          "present": present,
-          "absent": absent,
-          "percentage": percentage,
-          "attendance_log": attendance_log,
-      }
-
-    return {"status": "reg_not_found"}
-
-  except Exception as exc:
-    logger.exception("Sheet lookup failed: %s", exc)
-    return {"status": "sheet_error", "detail": str(exc)}
-
-
-def _col_letter(col: int) -> str:
-  result = ""
-  while col > 0:
-    col, rem = divmod(col - 1, 26)
-    result = chr(65 + rem) + result
-  return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Telegram Conversation & Broadcast Handlers
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-  await update.message.reply_text(
-      "👋 *Welcome to the Discrete Mathematics Attendance Bot!*\n\n"
-      "I will tell you your attendance percentage.\n\n"
-      "📋 Please enter your *Registration Number:*\n"
-      "_Example: 25151113001_",
-      parse_mode="Markdown",
-  )
-  return ASK_REG_NO
-
-
-async def received_reg_no(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-  reg_no = update.message.text.strip()
-  if not reg_no:
-    await update.message.reply_text(
-        "⚠️ Registration number cannot be empty.\nPlease enter it again:"
-    )
-    return ASK_REG_NO
-
-  context.user_data["reg_no"] = reg_no
-  await update.message.reply_text(
-      f"✅ Got it!  Reg No: `{reg_no}`\n\n"
-      "🔢 Now enter your *Roll Number:*\n"
-      "_Example: 12345_",
-      parse_mode="Markdown",
-  )
-  return ASK_ROLL_NO
-
-
-async def received_roll_no(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-  roll_no = update.message.text.strip()
-  reg_no = context.user_data.get("reg_no", "")
-
-  if not roll_no:
-    await update.message.reply_text(
-        "⚠️ Roll number cannot be empty. Please enter it again:"
-    )
-    return ASK_ROLL_NO
-
-  await update.message.reply_text("🔍 Fetching your attendance record…")
-  result = lookup_student(reg_no, roll_no)
-  status = result.get("status")
-
-  if status == "reg_not_found":
-    await update.message.reply_text(
-        "❌ *Registration number not found.*\nPlease check your Reg No and"
-        " try again with /start.",
-        parse_mode="Markdown",
-    )
-  elif status == "roll_mismatch":
-    await update.message.reply_text(
-        "❌ *Roll Number does not match our records.*\nPlease check your Roll"
-        " No and try again with /start.",
-        parse_mode="Markdown",
-    )
-  elif status == "sheet_error":
-    await update.message.reply_text(
-        "⚠️ *Could not reach the attendance sheet right now.*\nPlease try again"
-        " in a moment.",
-        parse_mode="Markdown",
-    )
-  else:
-    name = result["name"]
-    present = result["present"]
-    absent = result["absent"]
-    percentage = result["percentage"]
-    attendance_log = result.get("attendance_log", [])
-
-    # Save user record for broadcasting
-    chat_id = update.effective_chat.id
-    username = update.effective_user.username or ""
-    save_user_record(chat_id, username, reg_no, name)
-
-    try:
-      pct_val = float(str(percentage).replace("%", "").strip())
-      if pct_val >= 75:
-        pct_emoji = "🟢"
-        status_text = "Good Standing ✅"
-      elif pct_val >= 60:
-        pct_emoji = "🟡"
-        status_text = "At Risk ⚠️  — attend more classes"
-      else:
-        pct_emoji = "🔴"
-        status_text = "Shortage ❗ — immediate attention required"
-    except ValueError:
-      pct_emoji = "📊"
-      status_text = ""
-
-    await update.message.reply_text(
-        f"📋 *Attendance Record — Discrete Mathematics*\n"
-        f"{'─' * 34}\n"
-        f"👤 *Name:*               {name}\n"
-        f"🆔 *Reg No:*             `{reg_no}`\n"
-        f"🔢 *Roll No:*            `{roll_no}`\n"
-        f"✅ *Classes Attended:*  {present}\n"
-        f"❌ *Classes Missed:*    {absent}\n"
-        f"{pct_emoji} *Attendance:*    *{percentage}%*\n"
-        f"📌 *Status:*             {status_text}\n"
-        f"{'─' * 34}\n"
-        f"_Discrete Mathematics • Academic Year 2025-26_",
-        parse_mode="Markdown",
-    )
-
-    if attendance_log:
-      lines = ["📅 *Date-wise Attendance Log:*\n"]
-      for i, (date_label, status_char) in enumerate(attendance_log, start=1):
-        if status_char == "P":
-          mark = "✅ Present"
-        elif status_char == "A":
-          mark = "❌ Absent "
-        else:
-          mark = "➖ —      "
-        lines.append(f"`{i:02d}.` {date_label:<12}  {mark}")
-
-      CHUNK_SIZE = 4000
-      chunk = ""
-      for line in lines:
-        candidate = chunk + line + "\n"
-        if len(candidate) > CHUNK_SIZE:
-          await update.message.reply_text(chunk, parse_mode="Markdown")
-          chunk = line + "\n"
-        else:
-          chunk = candidate
-      if chunk.strip():
-        await update.message.reply_text(chunk, parse_mode="Markdown")
-
-  context.user_data.clear()
-  return ConversationHandler.END
-
-
-async def cmd_cancel(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-  context.user_data.clear()
-  await update.message.reply_text(
-      "🚫 Cancelled. Type /start anytime to check your attendance."
-  )
-  return ConversationHandler.END
-
-
-async def cmd_broadcast(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-  """Admin Command: /broadcast <message>"""
-  user_id = update.effective_user.id
-  if not ADMIN_ID or str(user_id) != ADMIN_ID:
-    await update.message.reply_text(
-        "⛔ You are not authorized to use this command."
-    )
-    return
-
-  if not context.args:
-    await update.message.reply_text(
-        "⚠️ Usage: `/broadcast <your message text>`", parse_mode="Markdown"
-    )
-    return
-
-  message
+    logger.info("
