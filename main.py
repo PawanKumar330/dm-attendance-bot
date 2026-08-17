@@ -133,7 +133,7 @@ def _open_worksheet() -> gspread.Worksheet:
   client = gspread.authorize(_build_creds())
   spreadsheet = client.open_by_key(SHEET_ID)
   worksheet = spreadsheet.sheet1
-  logger.info("Opened worksheet '%s'.", worksheet.title)
+  logger.info("Opened worksheet: %s", worksheet.title)
   return worksheet
 
 
@@ -167,4 +167,105 @@ def save_user_record(
         name,
         now_str,
     ])
-    logger.info("
+    logger.info("Saved user record to private Users sheet: %s", chat_id_str)
+  except Exception as exc:
+    logger.error("Failed to save user record: %s", exc)
+
+
+def get_all_user_chat_ids() -> list[int]:
+  """Retrieves all unique user Chat IDs from the private USERS_SHEET_ID spreadsheet."""
+  try:
+    client = gspread.authorize(_build_creds())
+    spreadsheet = client.open_by_key(USERS_SHEET_ID)
+    ws_users = spreadsheet.sheet1
+    all_rows = ws_users.get_all_values()
+    logger.info("Fetched %d rows from Users sheet.", len(all_rows))
+    chat_ids = []
+
+    for row in all_rows:
+      if not row:
+        continue
+      val = row[0].strip().lstrip("'")
+      try:
+        cid = int(val)
+        chat_ids.append(cid)
+      except ValueError:
+        continue
+
+    logger.info("Found %d valid Chat ID(s) for broadcast.", len(chat_ids))
+    return list(set(chat_ids))
+  except Exception as exc:
+    logger.error("Failed to fetch user chat IDs: %s", exc)
+    return []
+
+
+def lookup_student(reg_no: str, roll_no: str) -> dict:
+  try:
+    ws = _open_worksheet()
+    all_values = ws.get_all_values()
+
+    reg_no_clean = reg_no.strip().upper()
+    roll_no_clean = roll_no.strip()
+
+    # Retrieve date header row (checks row 105 first, falls back to row 7)
+    date_label_row = []
+    if len(all_values) >= DATE_LABEL_ROW and any(
+        x.strip() for x in all_values[DATE_LABEL_ROW - 1][COL_DATE_START - 1 :]
+    ):
+      date_label_row = all_values[DATE_LABEL_ROW - 1]
+    elif len(all_values) >= HEADER_ROW:
+      date_label_row = all_values[HEADER_ROW - 1]
+
+    # Find the last valid date column index
+    last_date_col = COL_DATE_START - 1
+    if date_label_row:
+      for c in range(COL_DATE_START, len(date_label_row) + 1):
+        if date_label_row[c - 1].strip():
+          last_date_col = c
+
+    data_rows = all_values[DATA_START_ROW - 1 :]
+
+    for row in data_rows:
+      needed = max(
+          COL_REG,
+          COL_ROLL,
+          COL_NAME,
+          COL_PRESENT,
+          COL_ABSENT,
+          COL_PERCENTAGE,
+      )
+      while len(row) < needed:
+        row.append("")
+
+      row_reg = row[COL_REG - 1].strip().upper()
+      if row_reg != reg_no_clean:
+        continue
+
+      row_roll = row[COL_ROLL - 1].strip()
+      if row_roll != roll_no_clean:
+        return {"status": "roll_mismatch"}
+
+      row_name = row[COL_NAME - 1].strip()
+      present = row[COL_PRESENT - 1].strip() or "0"
+      absent = row[COL_ABSENT - 1].strip() or "0"
+      percentage = row[COL_PERCENTAGE - 1].strip() or "N/A"
+
+      effective_last_col = last_date_col
+      if effective_last_col < COL_DATE_START:
+        for c in range(len(row), COL_DATE_START - 1, -1):
+          if row[c - 1].strip():
+            effective_last_col = c
+            break
+
+      attendance_log = []
+      if effective_last_col >= COL_DATE_START:
+        for col_idx in range(COL_DATE_START, effective_last_col + 1):
+          if col_idx <= len(date_label_row):
+            date_label = date_label_row[col_idx - 1].strip()
+          else:
+            date_label = ""
+
+          if not date_label:
+            date_label = _col_letter(col_idx)
+
+          cell_val = row[col_idx - 1].strip() if col_idx <= len(row) else
