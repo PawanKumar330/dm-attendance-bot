@@ -268,4 +268,312 @@ def lookup_student(reg_no: str, roll_no: str) -> dict:
           if not date_label:
             date_label = _col_letter(col_idx)
 
-          cell_val = row[col_idx - 1].strip() if col_idx <= len(row) else
+          cell_val = row[col_idx - 1].strip() if col_idx <= len(row) else ""
+          upper_val = cell_val.upper()
+
+          if upper_val in ("P", "PRESENT", "1"):
+            status_char = "P"
+          elif upper_val in ("A", "ABSENT", "0"):
+            status_char = "A"
+          else:
+            status_char = "-"
+
+          attendance_log.append((date_label, status_char))
+
+      return {
+          "status": "found",
+          "name": row_name,
+          "present": present,
+          "absent": absent,
+          "percentage": percentage,
+          "attendance_log": attendance_log,
+      }
+
+    return {"status": "reg_not_found"}
+
+  except Exception as exc:
+    logger.exception("Sheet lookup failed: %s", exc)
+    return {"status": "sheet_error", "detail": str(exc)}
+
+
+def _col_letter(col: int) -> str:
+  result = ""
+  while col > 0:
+    col, rem = divmod(col - 1, 26)
+    result = chr(65 + rem) + result
+  return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Telegram Conversation & Broadcast Handlers
+# ─────────────────────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+  await update.message.reply_text(
+      "👋 *Welcome to the Discrete Mathematics Attendance Bot!*\n\n"
+      "I will tell you your attendance percentage.\n\n"
+      "📋 Please enter your *Registration Number:*\n"
+      "_Example: 25151113001_",
+      parse_mode="Markdown",
+  )
+  return ASK_REG_NO
+
+
+async def received_reg_no(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+  reg_no = update.message.text.strip()
+  if not reg_no:
+    await update.message.reply_text(
+        "⚠️ Registration number cannot be empty.\nPlease enter it again:"
+    )
+    return ASK_REG_NO
+
+  context.user_data["reg_no"] = reg_no
+  await update.message.reply_text(
+      f"✅ Got it!  Reg No: `{reg_no}`\n\n"
+      "🔢 Now enter your *Roll Number:*\n"
+      "_Example: 12345_",
+      parse_mode="Markdown",
+  )
+  return ASK_ROLL_NO
+
+
+async def received_roll_no(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+  roll_no = update.message.text.strip()
+  reg_no = context.user_data.get("reg_no", "")
+
+  if not roll_no:
+    await update.message.reply_text(
+        "⚠️ Roll number cannot be empty. Please enter it again:"
+    )
+    return ASK_ROLL_NO
+
+  await update.message.reply_text("🔍 Fetching your attendance record…")
+  result = lookup_student(reg_no, roll_no)
+  status = result.get("status")
+
+  if status == "reg_not_found":
+    await update.message.reply_text(
+        "❌ *Registration number not found.*\nPlease check your Reg No and"
+        " try again with /start.",
+        parse_mode="Markdown",
+    )
+  elif status == "roll_mismatch":
+    await update.message.reply_text(
+        "❌ *Roll Number does not match our records.*\nPlease check your Roll"
+        " No and try again with /start.",
+        parse_mode="Markdown",
+    )
+  elif status == "sheet_error":
+    await update.message.reply_text(
+        "⚠️ *Could not reach the attendance sheet right now.*\nPlease try again"
+        " in a moment.",
+        parse_mode="Markdown",
+    )
+  else:
+    name = result["name"]
+    present = result["present"]
+    absent = result["absent"]
+    percentage = result["percentage"]
+    attendance_log = result.get("attendance_log", [])
+
+    # Save user record for broadcasting
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username or ""
+    save_user_record(chat_id, username, reg_no, name)
+
+    try:
+      pct_val = float(str(percentage).replace("%", "").strip())
+      if pct_val >= 75:
+        pct_emoji = "🟢"
+        status_text = "Good Standing ✅"
+      elif pct_val >= 60:
+        pct_emoji = "🟡"
+        status_text = "At Risk ⚠️  — attend more classes"
+      else:
+        pct_emoji = "🔴"
+        status_text = "Shortage ❗ — immediate attention required"
+    except ValueError:
+      pct_emoji = "📊"
+      status_text = ""
+
+    await update.message.reply_text(
+        f"📋 *Attendance Record — Discrete Mathematics*\n"
+        f"{'─' * 34}\n"
+        f"👤 *Name:*               {name}\n"
+        f"🆔 *Reg No:*             `{reg_no}`\n"
+        f"🔢 *Roll No:*            `{roll_no}`\n"
+        f"✅ *Classes Attended:*  {present}\n"
+        f"❌ *Classes Missed:*    {absent}\n"
+        f"{pct_emoji} *Attendance:*    *{percentage}%*\n"
+        f"📌 *Status:*             {status_text}\n"
+        f"{'─' * 34}\n"
+        f"_Discrete Mathematics • Academic Year 2025-26_",
+        parse_mode="Markdown",
+    )
+
+    if attendance_log:
+      lines = ["📅 *Date-wise Attendance Log:*\n"]
+      for i, (date_label, status_char) in enumerate(attendance_log, start=1):
+        if status_char == "P":
+          mark = "✅ Present"
+        elif status_char == "A":
+          mark = "❌ Absent "
+        else:
+          mark = "➖ —      "
+        lines.append(f"`{i:02d}.` {date_label:<12}  {mark}")
+
+      CHUNK_SIZE = 4000
+      chunk = ""
+      for line in lines:
+        candidate = chunk + line + "\n"
+        if len(candidate) > CHUNK_SIZE:
+          await update.message.reply_text(chunk, parse_mode="Markdown")
+          chunk = line + "\n"
+        else:
+          chunk = candidate
+      if chunk.strip():
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+
+  context.user_data.clear()
+  return ConversationHandler.END
+
+
+async def cmd_cancel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+  context.user_data.clear()
+  await update.message.reply_text(
+      "🚫 Cancelled. Type /start anytime to check your attendance."
+  )
+  return ConversationHandler.END
+
+
+async def cmd_broadcast(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+  """Admin Command: /broadcast <message>"""
+  user_id = update.effective_user.id
+  if not ADMIN_ID or str(user_id) != ADMIN_ID:
+    await update.message.reply_text(
+        "⛔ You are not authorized to use this command."
+    )
+    return
+
+  if not context.args:
+    await update.message.reply_text(
+        "⚠️ Usage: `/broadcast <your message text>`", parse_mode="Markdown"
+    )
+    return
+
+  message_text = " ".join(context.args)
+  chat_ids = get_all_user_chat_ids()
+
+  if not chat_ids:
+    await update.message.reply_text(
+        "⚠️ No user records found in the database."
+    )
+    return
+
+  await update.message.reply_text(
+      f"📢 Starting broadcast to {len(chat_ids)} user(s)…"
+  )
+  success_count = 0
+  fail_count = 0
+
+  for cid in chat_ids:
+    try:
+      await context.bot.send_message(
+          chat_id=cid, text=message_text, parse_mode="Markdown"
+      )
+      success_count += 1
+      await asyncio.sleep(0.05)
+    except Exception as exc:
+      logger.warning("Failed to send broadcast to %s: %s", cid, exc)
+      fail_count += 1
+
+  await update.message.reply_text(
+      f"✅ *Broadcast Complete!*\n\n"
+      f"📤 Sent: `{success_count}`\n"
+      f"❌ Failed / Blocked: `{fail_count}`",
+      parse_mode="Markdown",
+  )
+
+
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+  await update.message.reply_text(
+      "🤖 Type /start to check your attendance.\n"
+      "Type /cancel to stop at any time."
+  )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Application Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+def main() -> None:
+  print("=" * 50, flush=True)
+  print("🚀 Starting Discrete Mathematics Attendance Bot...", flush=True)
+  print("=" * 50, flush=True)
+
+  if not BOT_TOKEN:
+    logger.critical(
+        "BOT_TOKEN is missing! Set BOT_TOKEN in Render Environment Variables."
+    )
+    sys.stdout.flush()
+    sys.exit(1)
+
+  try:
+    _ = _build_creds()
+    logger.info("Google credentials verified.")
+  except Exception as e:
+    logger.critical("Google credentials verification failed: %s", e)
+    sys.stdout.flush()
+    sys.exit(1)
+
+  # Start HTTP server for Render health checks
+  start_health_check_server()
+
+  # Clean up any leftover webhooks
+  try:
+    with httpx.Client(timeout=15) as client:
+      r = client.post(
+          f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+          json={"drop_pending_updates": True},
+      )
+      logger.info("deleteWebhook response: %s", r.json())
+  except Exception as exc:
+    logger.warning("Could not delete webhook: %s", exc)
+
+  app = Application.builder().token(BOT_TOKEN).build()
+
+  conv = ConversationHandler(
+      entry_points=[CommandHandler("start", cmd_start)],
+      states={
+          ASK_REG_NO: [
+              MessageHandler(filters.TEXT & ~filters.COMMAND, received_reg_no)
+          ],
+          ASK_ROLL_NO: [
+              MessageHandler(filters.TEXT & ~filters.COMMAND, received_roll_no)
+          ],
+      },
+      fallbacks=[CommandHandler("cancel", cmd_cancel)],
+      allow_reentry=True,
+  )
+
+  app.add_handler(conv)
+  app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+  app.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+  logger.info("Bot is live and listening for messages...")
+  sys.stdout.flush()
+
+  app.run_polling(
+      allowed_updates=Update.ALL_TYPES,
+      drop_pending_updates=True,
+  )
+
+
+if __name__ == "__main__":
+  main()
