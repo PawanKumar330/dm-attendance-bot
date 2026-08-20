@@ -4,7 +4,9 @@
 Secure dual Google Sheets architecture:
 - SHEET_ID: Public attendance sheet (date labels row 105)
 - USERS_SHEET_ID: Private sheet for storing user Chat IDs for broadcasting
-- BEU Attendance Marks (out of 5) calculation based on BEU/Exam/428/2026/Patna
+- BEU Attendance Marks (out of 5) based on BEU/Exam/428/2026/Patna
+- Admin Live Alerts on every attendance check
+- Direct Two-Way Messaging: /contact (Student -> Admin) & /send (Admin -> Student)
 """
 
 import asyncio
@@ -334,7 +336,7 @@ def _col_letter(col: int) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Telegram Conversation & Broadcast Handlers
+# 7. Telegram Conversation & Custom Handlers
 # ─────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
   await update.message.reply_text(
@@ -432,6 +434,7 @@ async def received_roll_no(
       status_text = ""
       marks_display = "N/A"
 
+    # Send report to the student
     await update.message.reply_text(
         f"📋 *Attendance Record — Discrete Mathematics*\n"
         f"{'─' * 34}\n"
@@ -471,6 +474,34 @@ async def received_roll_no(
       if chunk.strip():
         await update.message.reply_text(chunk, parse_mode="Markdown")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Live Admin Notification on Attendance Check
+    # ─────────────────────────────────────────────────────────────────────────
+    if ADMIN_ID:
+      try:
+        user_info = update.effective_user
+        user_handle = f"@{user_info.username}" if user_info.username else "N/A"
+        current_time = datetime.now().strftime("%d %b %Y, %I:%M %p")
+
+        admin_alert = (
+            f"🔔 *Attendance Checked Alert*\n"
+            f"{'─' * 30}\n"
+            f"👤 *Student:* {name}\n"
+            f"🆔 *Reg No:* `{reg_no}` | *Roll:* `{roll_no}`\n"
+            f"📊 *Attendance:* *{percentage}%* ({marks_display} Marks)\n"
+            f"✅ *Attended:* {present} | ❌ *Missed:* {absent}\n"
+            f"📱 *Telegram:* {user_info.full_name} ({user_handle})\n"
+            f"💬 *Chat ID:* `{chat_id}`\n"
+            f"⏰ *Time:* `{current_time}`"
+        )
+        await context.bot.send_message(
+            chat_id=int(ADMIN_ID),
+            text=admin_alert,
+            parse_mode="Markdown",
+        )
+      except Exception as alert_exc:
+        logger.warning("Could not send admin notification: %s", alert_exc)
+
   context.user_data.clear()
   return ConversationHandler.END
 
@@ -483,6 +514,84 @@ async def cmd_cancel(
       "🚫 Cancelled. Type /start anytime to check your attendance."
   )
   return ConversationHandler.END
+
+
+async def cmd_contact(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+  """Student Command: /contact <message> -> Forwards message to the Admin."""
+  if not context.args:
+    await update.message.reply_text(
+        "⚠️ Usage: `/contact <your message or question>`",
+        parse_mode="Markdown",
+    )
+    return
+
+  user = update.effective_user
+  chat_id = update.effective_chat.id
+  user_text = " ".join(context.args)
+  reg_no = context.user_data.get("reg_no", "Not Specified")
+
+  admin_notification = (
+      f"📩 *New Message from Student:*\n"
+      f"👤 *Name:* {user.full_name} (@{user.username or 'N/A'})\n"
+      f"🆔 *Chat ID:* `{chat_id}`\n"
+      f"📋 *Reg No:* `{reg_no}`\n\n"
+      f"💬 *Message:*\n{user_text}\n\n"
+      f"👉 _To reply, use:_ `/send {chat_id} <your reply>`"
+  )
+
+  if ADMIN_ID:
+    try:
+      await context.bot.send_message(
+          chat_id=int(ADMIN_ID), text=admin_notification, parse_mode="Markdown"
+      )
+      await update.message.reply_text(
+          "✅ Your message has been forwarded to the instructor/admin."
+      )
+    except Exception as exc:
+      logger.error("Failed to forward to admin: %s", exc)
+      await update.message.reply_text(
+          "⚠️ Could not send your message right now. Please try again later."
+      )
+  else:
+    await update.message.reply_text("⚠️ Admin is not configured on this bot.")
+
+
+async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+  """Admin Command: /send <chat_id> <message> -> Send direct message to a student."""
+  user_id = update.effective_user.id
+  if not ADMIN_ID or str(user_id) != ADMIN_ID:
+    await update.message.reply_text(
+        "⛔ You are not authorized to use this command."
+    )
+    return
+
+  if len(context.args) < 2:
+    await update.message.reply_text(
+        "⚠️ Usage: `/send <chat_id> <your reply/message>`",
+        parse_mode="Markdown",
+    )
+    return
+
+  target_chat_id = context.args[0].strip()
+  message_to_send = " ".join(context.args[1:])
+
+  try:
+    await context.bot.send_message(
+        chat_id=int(target_chat_id),
+        text=f"💬 *Message from Admin:*\n\n{message_to_send}",
+        parse_mode="Markdown",
+    )
+    await update.message.reply_text(
+        f"✅ Message sent successfully to `{target_chat_id}`.",
+        parse_mode="Markdown",
+    )
+  except Exception as exc:
+    logger.error("Failed to send message to %s: %s", target_chat_id, exc)
+    await update.message.reply_text(
+        f"❌ Failed to send message: `{exc}`", parse_mode="Markdown"
+    )
 
 
 async def cmd_broadcast(
@@ -538,8 +647,11 @@ async def cmd_broadcast(
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   await update.message.reply_text(
-      "🤖 Type /start to check your attendance.\n"
-      "Type /cancel to stop at any time."
+      "🤖 *Commands Available:*\n"
+      "• /start — Check your attendance\n"
+      "• /contact <message> — Send a question/message to Admin\n"
+      "• /cancel — Cancel current action",
+      parse_mode="Markdown",
   )
 
 
@@ -597,6 +709,8 @@ def main() -> None:
   )
 
   app.add_handler(conv)
+  app.add_handler(CommandHandler("contact", cmd_contact))
+  app.add_handler(CommandHandler("send", cmd_send))
   app.add_handler(CommandHandler("broadcast", cmd_broadcast))
   app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
