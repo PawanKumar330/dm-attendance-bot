@@ -4,6 +4,7 @@
 Secure dual Google Sheets architecture:
 - SHEET_ID: Public attendance sheet (date labels row 105)
 - USERS_SHEET_ID: Private sheet for storing user Chat IDs for broadcasting
+- BEU Attendance Marks (out of 5) calculation based on BEU/Exam/428/2026/Patna
 """
 
 import asyncio
@@ -80,7 +81,35 @@ ASK_REG_NO, ASK_ROLL_NO = range(2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Render Health Check HTTP Server
+# 4. BEU Attendance Marks Helper
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate_beu_attendance_marks(percentage_val: float) -> int:
+  """Calculates BEU attendance marks out of 5 according to Notice Memo No.
+
+  BEU/Exam/428/2026/Patna:
+  - 96% - 100% : 5 Marks
+  - 91% - 95%  : 4 Marks
+  - 86% - 90%  : 3 Marks
+  - 81% - 85%  : 2 Marks
+  - 75% - 80%  : 1 Mark
+  - Below 75%  : 0 Marks
+  """
+  pct = round(percentage_val)
+  if pct >= 96:
+    return 5
+  elif pct >= 91:
+    return 4
+  elif pct >= 86:
+    return 3
+  elif pct >= 81:
+    return 2
+  elif pct >= 75:
+    return 1
+  return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Render Health Check HTTP Server
 # ─────────────────────────────────────────────────────────────────────────────
 def start_health_check_server() -> None:
   """Starts a lightweight HTTP server on $PORT for Render health checks."""
@@ -116,7 +145,7 @@ def start_health_check_server() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Google Sheets & User Logging Helpers
+# 6. Google Sheets & User Logging Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _build_creds() -> Credentials:
   if GOOGLE_CREDS_JSON:
@@ -305,12 +334,12 @@ def _col_letter(col: int) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Telegram Conversation & Broadcast Handlers
+# 7. Telegram Conversation & Broadcast Handlers
 # ─────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
   await update.message.reply_text(
       "👋 *Welcome to the Discrete Mathematics Attendance Bot!*\n\n"
-      "I will tell you your attendance percentage.\n\n"
+      "I will tell you your attendance percentage and BEU attendance marks.\n\n"
       "📋 Please enter your *Registration Number:*\n"
       "_Example: 25151113001_",
       parse_mode="Markdown",
@@ -386,6 +415,9 @@ async def received_roll_no(
 
     try:
       pct_val = float(str(percentage).replace("%", "").strip())
+      beu_marks = calculate_beu_attendance_marks(pct_val)
+      marks_display = f"{beu_marks} / 5"
+
       if pct_val >= 75:
         pct_emoji = "🟢"
         status_text = "Good Standing ✅"
@@ -398,6 +430,7 @@ async def received_roll_no(
     except ValueError:
       pct_emoji = "📊"
       status_text = ""
+      marks_display = "N/A"
 
     await update.message.reply_text(
         f"📋 *Attendance Record — Discrete Mathematics*\n"
@@ -408,6 +441,7 @@ async def received_roll_no(
         f"✅ *Classes Attended:*  {present}\n"
         f"❌ *Classes Missed:*    {absent}\n"
         f"{pct_emoji} *Attendance:*    *{percentage}%*\n"
+        f"🎯 *BEU Marks:*         *{marks_display}*\n"
         f"📌 *Status:*             {status_text}\n"
         f"{'─' * 34}\n"
         f"_Discrete Mathematics • Academic Year 2025-26_",
@@ -510,7 +544,7 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Application Entry Point
+# 8. Application Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
   print("=" * 50, flush=True)
