@@ -2,10 +2,9 @@
 validator.py — Google Sheet Attendance Template Validator.
 
 Validates whether a Google Sheets worksheet strictly conforms to the expected
-college attendance template.
+college attendance template without enforcing any date formatting on session columns.
 """
 
-from datetime import datetime
 import re
 from typing import Any, Dict, List, Optional
 import gspread
@@ -38,42 +37,6 @@ def normalize_header(text: str) -> str:
 NORMALIZED_BASE_HEADERS = [normalize_header(h) for h in EXPECTED_BASE_HEADERS]
 
 
-def is_valid_date_or_count(header_text: str) -> bool:
-    """
-    Check if a column header conforms to DD/MM/YYYY date format or class count (e.g. 50, 1, 2, Session 1).
-    """
-    clean = header_text.strip()
-    if not clean:
-        return False
-
-    # Check DD/MM/YYYY, D/M/YYYY, DD-MM-YYYY, or YYYY-MM-DD
-    date_patterns = [
-        r'^\d{1,2}/\d{1,2}/\d{4}$',
-        r'^\d{1,2}-\d{1,2}-\d{4}$',
-        r'^\d{4}-\d{1,2}-\d{1,2}$',
-        r'^\d{1,2}/\d{1,2}/\d{2}$',
-    ]
-    for pattern in date_patterns:
-        if re.match(pattern, clean):
-            return True
-
-    # Check date parsing with datetime
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y"):
-        try:
-            datetime.strptime(clean, fmt)
-            return True
-        except ValueError:
-            pass
-
-    # Check if it represents an integer class count (e.g. 50, 52, 1, 2) or "Session X" / "Class X"
-    if clean.isdigit():
-        return True
-    if re.match(r'^(session|class|c|s)?\s*\d+$', clean, re.IGNORECASE):
-        return True
-
-    return False
-
-
 def validate_attendance_sheet(worksheet: Optional[gspread.Worksheet] = None,
                               raw_data: Optional[List[List[Any]]] = None) -> Dict[str, Any]:
     """
@@ -92,7 +55,7 @@ def validate_attendance_sheet(worksheet: Optional[gspread.Worksheet] = None,
         {
             'valid': bool,
             'errors': list of str (fatal errors),
-            'warnings': list of str (formatting warnings),
+            'warnings': list of str (non-fatal warnings),
             'student_count': int,
             'session_count': int
         }
@@ -133,7 +96,7 @@ def validate_attendance_sheet(worksheet: Optional[gspread.Worksheet] = None,
 
     # ─────────────────────────────────────────────────────────────────
     # 1. Locate Header Row (search within rows 1 to 15)
-    # College sheets frequently place the header on Row 6 (after title & faculty name)
+    # Must contain base columns: ['S.NO', 'Roll NO', 'Reg.NO', 'Student Name', 'Present', 'Absent', 'Percentage']
     # ─────────────────────────────────────────────────────────────────
     header_row_idx: Optional[int] = None
     header_row: List[str] = []
@@ -182,38 +145,20 @@ def validate_attendance_sheet(worksheet: Optional[gspread.Worksheet] = None,
         }
 
     # ─────────────────────────────────────────────────────────────────
-    # 2. Check Session / Date Columns (Column H / index 7 onwards)
-    # Date headers may be on the header row (e.g. Row 6) OR on upper rows (e.g. Row 1-5)
-    # with class counts on Row 6.
+    # 2. Identify Attendance Session Columns (Column H / index 7 onwards)
+    # No date checking required. All non-empty columns from index 7
+    # onwards are treated as attendance session columns.
     # ─────────────────────────────────────────────────────────────────
     session_cols: List[int] = []
+    max_cols = max(len(r) for r in rows)
 
-    # Determine maximum number of columns across header and pre-header rows
-    max_header_cols = max(len(rows[r]) for r in range(header_row_idx + 1))
-
-    for c_idx in range(7, max_header_cols):
-        # Collect values in this column across rows 0 through header_row_idx
-        col_cells = [
-            str(rows[r][c_idx]).strip()
-            for r in range(header_row_idx + 1)
-            if c_idx < len(rows[r]) and str(rows[r][c_idx]).strip()
-        ]
-
-        if col_cells:
+    for c_idx in range(7, max_cols):
+        # Column is considered an active session column if it has any cell with data
+        col_has_data = any(c_idx < len(r) and str(r[c_idx]).strip() for r in rows)
+        if col_has_data:
             session_cols.append(c_idx)
-            col_letter = col_index_to_letter(c_idx + 1)
-
-            # Check if any cell in this column header area contains a valid date or class count
-            has_valid_indicator = any(is_valid_date_or_count(text) for text in col_cells)
-            if not has_valid_indicator:
-                display_text = col_cells[-1] if col_cells else "N/A"
-                warnings.append(
-                    f"Column {col_letter} header '{display_text}' is not formatted as DD/MM/YYYY or class count."
-                )
 
     session_count = len(session_cols)
-    if session_count == 0:
-        warnings.append("No attendance date/session columns found starting from Column H onwards.")
 
     # ─────────────────────────────────────────────────────────────────
     # 3. Validate Student Data Rows
@@ -228,7 +173,7 @@ def validate_attendance_sheet(worksheet: Optional[gspread.Worksheet] = None,
         if not any(str(c).strip() for c in row):
             continue
 
-        # Skip spacer / hidden rows that have no student identifier (S.NO, Roll NO, Reg.NO, Student Name)
+        # Skip spacer / hidden rows that lack student identifiers (S.NO, Roll NO, Reg.NO, Student Name)
         identity_cells = [str(row[i]).strip() for i in range(min(4, len(row))) if str(row[i]).strip()]
         if not identity_cells:
             continue
@@ -314,7 +259,7 @@ def validate_attendance_sheet(worksheet: Optional[gspread.Worksheet] = None,
         else:
             errors.append(f"Row {row_num} ({student_identifier}): Missing 'Percentage' value.")
 
-        # Check Attendance cells under date columns: Allowed values are 'P', 'A', or blank/empty
+        # Check Attendance marks: Allowed values are 'P', 'A', or blank/empty
         for c_idx in session_cols:
             col_letter = col_index_to_letter(c_idx + 1)
             mark = cells[c_idx] if c_idx < len(cells) else ""
