@@ -1,734 +1,401 @@
-"""main.py — Discrete Mathematics Attendance Telegram Bot
-
-======================================================
-Secure dual Google Sheets architecture:
-- SHEET_ID: Public attendance sheet (date labels row 105)
-- USERS_SHEET_ID: Private sheet for storing user Chat IDs for broadcasting
-- BEU Attendance Marks (out of 5) based on BEU/Exam/428/2026/Patna
-- Admin Live Alerts on every attendance check
-- Direct Two-Way Messaging: /contact (Student -> Admin) & /send (Admin -> Student)
+"""
+main.py — Automated Google Sheet Attendance Template Validator Telegram Bot.
+=============================================================================
+Listens for Google Sheets URLs or Document IDs, fetches sheets via gspread,
+and automatically validates whether the layout, headers, and student data strictly
+conform to the expected college attendance template.
 """
 
 import asyncio
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import logging
 import os
+import re
 import sys
 import threading
+from typing import Optional, Tuple
 
 from dotenv import load_dotenv
-from google.oauth2.service_account import Credentials
 import gspread
 import httpx
-from telegram import Update
+from telegram import Update, constants
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
 
+from validator import validate_attendance_sheet
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Environment variables
+# 1. Environment variables (strictly loaded via os.getenv)
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-SHEET_ID = os.environ.get(
-    "SHEET_ID", "1f2XM7HFk0IYSiOyKYEKkNMd3j-lB6NgLS0qlh5M3o0M"
-).strip()
-USERS_SHEET_ID = os.environ.get(
-    "USERS_SHEET_ID", "1lr27rxF3KZqdeXg8cuaLYeL0nTUjREIiecXA8cNXdMA"
-).strip()
-GOOGLE_CREDS_PATH = os.environ.get("GOOGLE_CREDS_PATH", "credentials.json").strip()
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
-ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
+GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "credentials.json")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Sheet layout constants
-# ─────────────────────────────────────────────────────────────────────────────
-HEADER_ROW = 7
-DATA_START_ROW = 8
-
-COL_ROLL = 2  # B  → Roll No
-COL_REG = 3  # C  → Reg No
-COL_NAME = 4  # D  → Name
-COL_PRESENT = 5  # E  → Present
-COL_ABSENT = 6  # F  → Absent
-COL_PERCENTAGE = 7  # G  → Percentage
-COL_DATE_START = 8  # H  → First date column
-DATE_LABEL_ROW = 105  # Row where date labels are located
-
-SCOPES = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Logging
+# 2. Logging
 # ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("dm_bot")
+logger = logging.getLogger("sheet_validator_bot")
 
-ASK_REG_NO, ASK_ROLL_NO = range(2)
+SHEET_URL_REGEX = re.compile(r'https://docs\.google\.com/spreadsheets/d/([a-zA-Z0-9-_]+)')
+DOC_ID_REGEX = re.compile(r'^[a-zA-Z0-9-_]{25,60}$')
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. BEU Attendance Marks Helper
-# ─────────────────────────────────────────────────────────────────────────────
-def calculate_beu_attendance_marks(percentage_val: float) -> int:
-  """Calculates BEU attendance marks out of 5 according to Notice Memo No.
-
-  BEU/Exam/428/2026/Patna:
-  - 96% - 100% : 5 Marks
-  - 91% - 95%  : 4 Marks
-  - 86% - 90%  : 3 Marks
-  - 81% - 85%  : 2 Marks
-  - 75% - 80%  : 1 Mark
-  - Below 75%  : 0 Marks
-  """
-  pct = round(percentage_val)
-  if pct >= 96:
-    return 5
-  elif pct >= 91:
-    return 4
-  elif pct >= 86:
-    return 3
-  elif pct >= 81:
-    return 2
-  elif pct >= 75:
-    return 1
-  return 0
+def escape_md(text: str) -> str:
+    """Escape markdown special characters for Telegram legacy Markdown."""
+    return re.sub(r'([_*`\[\]])', r'\\\1', str(text))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Render Health Check HTTP Server
+# 3. Render Health Check HTTP Server
 # ─────────────────────────────────────────────────────────────────────────────
 def start_health_check_server() -> None:
-  """Starts a lightweight HTTP server on $PORT for Render health checks."""
-  port_env = os.environ.get("PORT", "10000").strip()
-  try:
-    port = int(port_env)
-  except ValueError:
-    port = 10000
+    """Starts a lightweight HTTP server on $PORT for Render health checks."""
+    port_env = os.environ.get("PORT", "10000").strip()
+    try:
+        port = int(port_env)
+    except ValueError:
+        port = 10000
 
-  class HealthCheckHandler(BaseHTTPRequestHandler):
+    class HealthCheckHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
 
-    def do_GET(self):
-      self.send_response(200)
-      self.send_header("Content-Type", "text/plain")
-      self.end_headers()
-      self.wfile.write(b"OK")
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
 
-    def do_HEAD(self):
-      self.send_response(200)
-      self.send_header("Content-Type", "text/plain")
-      self.end_headers()
+        def log_message(self, format, *args):
+            pass
 
-    def log_message(self, format, *args):
-      pass
-
-  try:
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logger.info("Health check HTTP server running on port %d", port)
-  except Exception as exc:
-    logger.warning("Could not start health check HTTP server: %s", exc)
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info("Health check HTTP server running on port %d", port)
+    except Exception as exc:
+        logger.warning("Could not start health check HTTP server: %s", exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Google Sheets & User Logging Helpers
+# 4. Google Sheets authentication helper
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_creds() -> Credentials:
-  if GOOGLE_CREDS_JSON:
-    info = json.loads(GOOGLE_CREDS_JSON)
-    return Credentials.from_service_account_info(info, scopes=SCOPES)
-  if GOOGLE_CREDS_PATH and os.path.exists(GOOGLE_CREDS_PATH):
-    return Credentials.from_service_account_file(
-        GOOGLE_CREDS_PATH, scopes=SCOPES
+def get_gspread_client() -> Tuple[Optional[gspread.Client], Optional[str], Optional[str]]:
+    """
+    Initializes gspread client from GOOGLE_CREDENTIALS_JSON or local credentials file.
+    Returns: (client, service_account_email, error_message)
+    """
+    creds_env = GOOGLE_CREDENTIALS_JSON.strip()
+
+    # Case 1: Raw JSON string provided in environment variable
+    if creds_env:
+        try:
+            info = json.loads(creds_env)
+            client = gspread.service_account_from_dict(info)
+            email = info.get("client_email", "your-service-account@iam.gserviceaccount.com")
+            return client, email, None
+        except Exception as e:
+            logger.error("Failed to parse GOOGLE_CREDENTIALS_JSON string: %s", e)
+            return None, None, f"❌ Failed to parse `GOOGLE_CREDENTIALS_JSON`: `{escape_md(str(e))}`"
+
+    # Case 2: File path provided via GOOGLE_CREDS_PATH or local credentials.json
+    creds_file = GOOGLE_CREDS_PATH.strip()
+    if not os.path.isfile(creds_file):
+        local_service_account = os.path.join(os.path.dirname(os.path.abspath(__file__)), "service_account.json")
+        if os.path.isfile(local_service_account):
+            creds_file = local_service_account
+
+    if os.path.isfile(creds_file):
+        try:
+            with open(creds_file, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            client = gspread.service_account(filename=creds_file)
+            email = info.get("client_email", "your-service-account@iam.gserviceaccount.com")
+            return client, email, None
+        except Exception as e:
+            logger.error("Failed to load credentials from file '%s': %s", creds_file, e)
+            return None, None, f"❌ Failed to load credentials from `{creds_file}`: `{escape_md(str(e))}`"
+
+    return None, None, (
+        "⚠️ *Google Service Account Not Configured*\n\n"
+        "Neither `GOOGLE_CREDENTIALS_JSON` nor a valid `credentials.json` file was found.\n"
+        "Please provide Google service account credentials in `.env` to enable sheet validation."
     )
-  raise RuntimeError("No Google credentials found.")
 
 
-def _open_worksheet() -> gspread.Worksheet:
-  client = gspread.authorize(_build_creds())
-  spreadsheet = client.open_by_key(SHEET_ID)
-  worksheet = spreadsheet.sheet1
-  logger.info("Opened worksheet: %s", worksheet.title)
-  return worksheet
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Sheet validation handler
+# ─────────────────────────────────────────────────────────────────────────────
+async def process_sheet_validation(update: Update, context: ContextTypes.DEFAULT_TYPE, doc_id: str) -> None:
+    """
+    Fetches the spreadsheet by doc_id, iterates over all worksheets,
+    runs validate_attendance_sheet on each, and sends a formatted Markdown report.
+    """
+    # 1. Immediate acknowledgement & typing indicator
+    ack_msg = await update.message.reply_text("🔍 *Validating sheet template...*", parse_mode="Markdown")
+    if update.effective_chat:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
 
-
-def save_user_record(
-    chat_id: int, username: str, reg_no: str, name: str
-) -> None:
-  """Saves student Chat ID into the private USERS_SHEET_ID spreadsheet."""
-  try:
-    client = gspread.authorize(_build_creds())
-    spreadsheet = client.open_by_key(USERS_SHEET_ID)
-    ws_users = spreadsheet.sheet1
-    all_rows = ws_users.get_all_values()
-
-    if not all_rows:
-      ws_users.append_row(
-          ["Chat ID", "Username", "Reg No", "Name", "Last Active"]
-      )
-      all_rows = ws_users.get_all_values()
-
-    chat_id_str = str(chat_id)
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    for row in all_rows[1:]:
-      if row and row[0].strip() == chat_id_str:
+    # 2. Get gspread client
+    client, sa_email, err_msg = get_gspread_client()
+    if err_msg:
+        await ack_msg.edit_text(err_msg, parse_mode="Markdown")
         return
 
-    ws_users.append_row([
-        chat_id_str,
-        f"@{username}" if username else "",
-        reg_no,
-        name,
-        now_str,
-    ])
-    logger.info("Saved user record to private Users sheet: %s", chat_id_str)
-  except Exception as exc:
-    logger.error("Failed to save user record: %s", exc)
+    # 3. Open spreadsheet
+    try:
+        spreadsheet = client.open_by_key(doc_id)
+    except gspread.exceptions.SpreadsheetNotFound:
+        email_str = f"`{sa_email}`" if sa_email else "the bot's service account"
+        msg = (
+            "⚠️ *Permission Denied / Sheet Not Found*\n\n"
+            "The bot cannot access this Google Sheet.\n\n"
+            "👉 Please ensure you have shared the spreadsheet with **Viewer** access to:\n"
+            f"{email_str}\n\n"
+            "Also verify that the document link or ID is correct."
+        )
+        await ack_msg.edit_text(msg, parse_mode="Markdown")
+        return
+    except gspread.exceptions.APIError as api_err:
+        err_str = str(api_err)
+        if "PERMISSION_DENIED" in err_str or "403" in err_str or "404" in err_str:
+            email_str = f"`{sa_email}`" if sa_email else "the bot's service account"
+            msg = (
+                "⚠️ *Permission Denied*\n\n"
+                "The bot lacks view permission for this Google Sheet.\n\n"
+                "👉 Please share the spreadsheet with **Viewer** access to:\n"
+                f"{email_str}"
+            )
+        else:
+            msg = f"❌ *Google API Error:* `{escape_md(err_str)}`"
+        await ack_msg.edit_text(msg, parse_mode="Markdown")
+        return
+    except Exception as exc:
+        logger.error("Error opening spreadsheet %s: %s", doc_id, exc, exc_info=True)
+        await ack_msg.edit_text(f"❌ *Failed to open spreadsheet:* `{escape_md(str(exc))}`", parse_mode="Markdown")
+        return
 
+    # 4. Fetch all worksheet tabs (e.g. Sheet1, DSA, Discrete Mathematics)
+    try:
+        worksheets = spreadsheet.worksheets()
+    except Exception as exc:
+        await ack_msg.edit_text(f"❌ *Failed to inspect sheet tabs:* `{escape_md(str(exc))}`", parse_mode="Markdown")
+        return
 
-def get_all_user_chat_ids() -> list[int]:
-  """Retrieves all unique user Chat IDs from the private USERS_SHEET_ID spreadsheet."""
-  try:
-    client = gspread.authorize(_build_creds())
-    spreadsheet = client.open_by_key(USERS_SHEET_ID)
-    ws_users = spreadsheet.sheet1
-    all_rows = ws_users.get_all_values()
-    logger.info("Fetched %d rows from Users sheet.", len(all_rows))
-    chat_ids = []
+    if not worksheets:
+        await ack_msg.edit_text("❌ *The spreadsheet contains no worksheets.*", parse_mode="Markdown")
+        return
 
-    for row in all_rows:
-      if not row:
-        continue
-      val = row[0].strip().lstrip("'")
-      try:
-        cid = int(val)
-        chat_ids.append(cid)
-      except ValueError:
-        continue
+    all_errors = []
+    all_warnings = []
+    total_students = 0
+    total_sessions = 0
+    tab_reports = []
+    all_valid = True
 
-    logger.info("Found %d valid Chat ID(s) for broadcast.", len(chat_ids))
-    return list(set(chat_ids))
-  except Exception as exc:
-    logger.error("Failed to fetch user chat IDs: %s", exc)
-    return []
+    # 5. Validate each tab
+    for ws in worksheets:
+        tab_title = ws.title
+        res = validate_attendance_sheet(worksheet=ws)
+        if not res['valid']:
+            all_valid = False
+            for err in res['errors']:
+                all_errors.append(f"[{tab_title}] {err}")
+        else:
+            total_students += res['student_count']
+            total_sessions += res['session_count']
 
+        for warn in res['warnings']:
+            all_warnings.append(f"[{tab_title}] {warn}")
 
-def lookup_student(reg_no: str, roll_no: str) -> dict:
-  try:
-    ws = _open_worksheet()
-    all_values = ws.get_all_values()
+        tab_reports.append({
+            'title': tab_title,
+            'valid': res['valid'],
+            'student_count': res['student_count'],
+            'session_count': res['session_count'],
+        })
 
-    reg_no_clean = reg_no.strip().upper()
-    roll_no_clean = roll_no.strip()
+    sheet_title_escaped = escape_md(spreadsheet.title)
 
-    # Retrieve date header row (checks row 105 first, falls back to row 7)
-    date_label_row = []
-    if len(all_values) >= DATE_LABEL_ROW and any(
-        x.strip() for x in all_values[DATE_LABEL_ROW - 1][COL_DATE_START - 1 :]
-    ):
-      date_label_row = all_values[DATE_LABEL_ROW - 1]
-    elif len(all_values) >= HEADER_ROW:
-      date_label_row = all_values[HEADER_ROW - 1]
+    # 6. Format Markdown response
+    if all_valid:
+        tabs_display = ", ".join([f"`{escape_md(t['title'])}`" for t in tab_reports])
+        response = (
+            "✅ *Template Verified Successfully*\n\n"
+            f"📋 *Spreadsheet:* {sheet_title_escaped}\n"
+            f"📁 *Tabs Verified:* {len(worksheets)} tab(s) ({tabs_display})\n\n"
+            f"📊 *Summary Metrics:*\n"
+            f"• *Student Count Identified:* `{total_students}`\n"
+            f"• *Sessions Tracked:* `{total_sessions}`\n"
+            f"• *Status:* Strictly conforms to expected attendance schema."
+        )
+        if all_warnings:
+            response += "\n\n⚠️ *Formatting Notes:*\n"
+            for w in all_warnings[:3]:
+                response += f"• {escape_md(w)}\n"
+            if len(all_warnings) > 3:
+                response += f"• _...and {len(all_warnings) - 3} more minor note(s)._\n"
+    else:
+        response = (
+            "❌ *Template Mismatch Found*\n\n"
+            f"📋 *Spreadsheet:* {sheet_title_escaped}\n\n"
+            "*Critical Errors Found (Top 5):*\n"
+        )
+        for err in all_errors[:5]:
+            response += f"• {escape_md(err)}\n"
 
-    # Find the last valid date column index
-    last_date_col = COL_DATE_START - 1
-    if date_label_row:
-      for c in range(COL_DATE_START, len(date_label_row) + 1):
-        if date_label_row[c - 1].strip():
-          last_date_col = c
+        if len(all_errors) > 5:
+            response += f"\n_...and {len(all_errors) - 5} more error(s)._\n"
 
-    data_rows = all_values[DATA_START_ROW - 1 :]
-
-    for row in data_rows:
-      needed = max(
-          COL_REG,
-          COL_ROLL,
-          COL_NAME,
-          COL_PRESENT,
-          COL_ABSENT,
-          COL_PERCENTAGE,
-      )
-      while len(row) < needed:
-        row.append("")
-
-      row_reg = row[COL_REG - 1].strip().upper()
-      if row_reg != reg_no_clean:
-        continue
-
-      row_roll = row[COL_ROLL - 1].strip()
-      if row_roll != roll_no_clean:
-        return {"status": "roll_mismatch"}
-
-      row_name = row[COL_NAME - 1].strip()
-      present = row[COL_PRESENT - 1].strip() or "0"
-      absent = row[COL_ABSENT - 1].strip() or "0"
-      percentage = row[COL_PERCENTAGE - 1].strip() or "N/A"
-
-      effective_last_col = last_date_col
-      if effective_last_col < COL_DATE_START:
-        for c in range(len(row), COL_DATE_START - 1, -1):
-          if row[c - 1].strip():
-            effective_last_col = c
-            break
-
-      attendance_log = []
-      if effective_last_col >= COL_DATE_START:
-        for col_idx in range(COL_DATE_START, effective_last_col + 1):
-          if col_idx <= len(date_label_row):
-            date_label = date_label_row[col_idx - 1].strip()
-          else:
-            date_label = ""
-
-          if not date_label:
-            date_label = _col_letter(col_idx)
-
-          cell_val = row[col_idx - 1].strip() if col_idx <= len(row) else ""
-          upper_val = cell_val.upper()
-
-          if upper_val in ("P", "PRESENT", "1"):
-            status_char = "P"
-          elif upper_val in ("A", "ABSENT", "0"):
-            status_char = "A"
-          else:
-            status_char = "-"
-
-          attendance_log.append((date_label, status_char))
-
-      return {
-          "status": "found",
-          "name": row_name,
-          "present": present,
-          "absent": absent,
-          "percentage": percentage,
-          "attendance_log": attendance_log,
-      }
-
-    return {"status": "reg_not_found"}
-
-  except Exception as exc:
-    logger.exception("Sheet lookup failed: %s", exc)
-    return {"status": "sheet_error", "detail": str(exc)}
-
-
-def _col_letter(col: int) -> str:
-  result = ""
-  while col > 0:
-    col, rem = divmod(col - 1, 26)
-    result = chr(65 + rem) + result
-  return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. Telegram Conversation & Custom Handlers
-# ─────────────────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-  await update.message.reply_text(
-      "👋 *Welcome to the Discrete Mathematics Attendance Bot!*\n\n"
-      "I will tell you your attendance percentage and BEU attendance marks.\n\n"
-      "📋 Please enter your *Registration Number:*\n"
-      "_Example: 25151113001_",
-      parse_mode="Markdown",
-  )
-  return ASK_REG_NO
-
-
-async def received_reg_no(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-  reg_no = update.message.text.strip()
-  if not reg_no:
-    await update.message.reply_text(
-        "⚠️ Registration number cannot be empty.\nPlease enter it again:"
-    )
-    return ASK_REG_NO
-
-  context.user_data["reg_no"] = reg_no
-  await update.message.reply_text(
-      f"✅ Got it!  Reg No: `{reg_no}`\n\n"
-      "🔢 Now enter your *Roll Number:*\n"
-      "_Example: 12345_",
-      parse_mode="Markdown",
-  )
-  return ASK_ROLL_NO
-
-
-async def received_roll_no(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-  roll_no = update.message.text.strip()
-  reg_no = context.user_data.get("reg_no", "")
-
-  if not roll_no:
-    await update.message.reply_text(
-        "⚠️ Roll number cannot be empty. Please enter it again:"
-    )
-    return ASK_ROLL_NO
-
-  await update.message.reply_text("🔍 Fetching your attendance record…")
-  result = lookup_student(reg_no, roll_no)
-  status = result.get("status")
-
-  if status == "reg_not_found":
-    await update.message.reply_text(
-        "❌ *Registration number not found.*\nPlease check your Reg No and"
-        " try again with /start.",
-        parse_mode="Markdown",
-    )
-  elif status == "roll_mismatch":
-    await update.message.reply_text(
-        "❌ *Roll Number does not match our records.*\nPlease check your Roll"
-        " No and try again with /start.",
-        parse_mode="Markdown",
-    )
-  elif status == "sheet_error":
-    await update.message.reply_text(
-        "⚠️ *Could not reach the attendance sheet right now.*\nPlease try again"
-        " in a moment.",
-        parse_mode="Markdown",
-    )
-  else:
-    name = result["name"]
-    present = result["present"]
-    absent = result["absent"]
-    percentage = result["percentage"]
-    attendance_log = result.get("attendance_log", [])
-
-    # Save user record for broadcasting
-    chat_id = update.effective_chat.id
-    username = update.effective_user.username or ""
-    save_user_record(chat_id, username, reg_no, name)
+        response += (
+            f"\n*(Total critical errors: {len(all_errors)})*\n\n"
+            "Please fix the headers, sequences, or values in your Google Sheet and send the link again."
+        )
 
     try:
-      pct_val = float(str(percentage).replace("%", "").strip())
-      beu_marks = calculate_beu_attendance_marks(pct_val)
-      marks_display = f"{beu_marks} / 5"
+        await ack_msg.edit_text(response, parse_mode="Markdown")
+    except Exception as send_err:
+        logger.warning("Markdown formatting rejected (%s). Sending plain text fallback.", send_err)
+        plain = response.replace("*", "").replace("`", "").replace("_", "")
+        await ack_msg.edit_text(plain)
 
-      if pct_val >= 75:
-        pct_emoji = "🟢"
-        status_text = "Good Standing ✅"
-      elif pct_val >= 60:
-        pct_emoji = "🟡"
-        status_text = "At Risk ⚠️  — attend more classes"
-      else:
-        pct_emoji = "🔴"
-        status_text = "Shortage ❗ — immediate attention required"
-    except ValueError:
-      pct_emoji = "📊"
-      status_text = ""
-      marks_display = "N/A"
 
-    # Send report to the student
-    await update.message.reply_text(
-        f"📋 *Attendance Record — Discrete Mathematics*\n"
-        f"{'─' * 34}\n"
-        f"👤 *Name:*               {name}\n"
-        f"🆔 *Reg No:*             `{reg_no}`\n"
-        f"🔢 *Roll No:*            `{roll_no}`\n"
-        f"✅ *Classes Attended:*  {present}\n"
-        f"❌ *Classes Missed:*    {absent}\n"
-        f"{pct_emoji} *Attendance:*    *{percentage}%*\n"
-        f"🎯 *BEU Marks:*         *{marks_display}*\n"
-        f"📌 *Status:*             {status_text}\n"
-        f"{'─' * 34}\n"
-        f"_Discrete Mathematics • Academic Year 2025-26_",
-        parse_mode="Markdown",
-    )
+async def sheet_link_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Detects Google Sheets links or document IDs in incoming messages."""
+    if not update.message or not update.message.text:
+        return
 
-    if attendance_log:
-      lines = ["📅 *Date-wise Attendance Log:*\n"]
-      for i, (date_label, status_char) in enumerate(attendance_log, start=1):
-        if status_char == "P":
-          mark = "✅ Present"
-        elif status_char == "A":
-          mark = "❌ Absent "
-        else:
-          mark = "➖ —      "
-        lines.append(f"`{i:02d}.` {date_label:<12}  {mark}")
+    text = update.message.text.strip()
 
-      CHUNK_SIZE = 4000
-      chunk = ""
-      for line in lines:
-        candidate = chunk + line + "\n"
-        if len(candidate) > CHUNK_SIZE:
-          await update.message.reply_text(chunk, parse_mode="Markdown")
-          chunk = line + "\n"
-        else:
-          chunk = candidate
-      if chunk.strip():
-        await update.message.reply_text(chunk, parse_mode="Markdown")
+    # Match Google Sheets URL
+    url_match = SHEET_URL_REGEX.search(text)
+    if url_match:
+        doc_id = url_match.group(1)
+        await process_sheet_validation(update, context, doc_id)
+        return
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Live Admin Notification on Attendance Check
-    # ─────────────────────────────────────────────────────────────────────────
-    if ADMIN_ID:
-      try:
-        user_info = update.effective_user
-        user_handle = f"@{user_info.username}" if user_info.username else "N/A"
-        current_time = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    # Match standalone Document ID
+    if DOC_ID_REGEX.match(text) and not text.startswith("/"):
+        await process_sheet_validation(update, context, text)
+        return
 
-        admin_alert = (
-            f"🔔 *Attendance Checked Alert*\n"
-            f"{'─' * 30}\n"
-            f"👤 *Student:* {name}\n"
-            f"🆔 *Reg No:* `{reg_no}` | *Roll:* `{roll_no}`\n"
-            f"📊 *Attendance:* *{percentage}%* ({marks_display} Marks)\n"
-            f"✅ *Attended:* {present} | ❌ *Missed:* {absent}\n"
-            f"📱 *Telegram:* {user_info.full_name} ({user_handle})\n"
-            f"💬 *Chat ID:* `{chat_id}`\n"
-            f"⏰ *Time:* `{current_time}`"
-        )
-        await context.bot.send_message(
-            chat_id=int(ADMIN_ID),
-            text=admin_alert,
+
+async def cmd_validate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Command handler: /validate <url_or_id>"""
+    if not context.args:
+        await update.message.reply_text(
+            "📋 *Google Sheet Template Validator*\n\n"
+            "Send or share any Google Sheets link to validate its attendance template.\n\n"
+            "*Usage:*\n"
+            "Simply paste the link directly in this chat, or type:\n"
+            "`/validate <Google_Sheet_URL_or_ID>`",
             parse_mode="Markdown",
         )
-      except Exception as alert_exc:
-        logger.warning("Could not send admin notification: %s", alert_exc)
+        return
 
-  context.user_data.clear()
-  return ConversationHandler.END
-
-
-async def cmd_cancel(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-  context.user_data.clear()
-  await update.message.reply_text(
-      "🚫 Cancelled. Type /start anytime to check your attendance."
-  )
-  return ConversationHandler.END
+    arg = context.args[0].strip()
+    url_match = SHEET_URL_REGEX.search(arg)
+    doc_id = url_match.group(1) if url_match else arg
+    await process_sheet_validation(update, context, doc_id)
 
 
-async def cmd_contact(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-  """Student Command: /contact <message> -> Forwards message to the Admin."""
-  if not context.args:
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — Greeting and instructions."""
     await update.message.reply_text(
-        "⚠️ Usage: `/contact <your message or question>`",
+        "👋 *Welcome to the Attendance Template Validator Bot!*\n\n"
+        "📊 *How to validate a Google Sheet:*\n"
+        "Just paste any Google Sheets link directly into this chat, or use:\n"
+        "`/validate <Google_Sheet_URL>`\n\n"
+        "The bot will automatically check:\n"
+        "• Required headers in exact sequence (`['S.NO', 'Roll NO', 'Reg.NO', 'Student Name', 'Present', 'Absent', 'Percentage']`)\n"
+        "• Date session columns (`DD/MM/YYYY`)\n"
+        "• Incremental S.NO & 11-digit Reg.NO\n"
+        "• Valid attendance marks (`P`, `A`, or blank)\n\n"
+        "Type /help for more information.",
         parse_mode="Markdown",
     )
-    return
-
-  user = update.effective_user
-  chat_id = update.effective_chat.id
-  user_text = " ".join(context.args)
-  reg_no = context.user_data.get("reg_no", "Not Specified")
-
-  admin_notification = (
-      f"📩 *New Message from Student:*\n"
-      f"👤 *Name:* {user.full_name} (@{user.username or 'N/A'})\n"
-      f"🆔 *Chat ID:* `{chat_id}`\n"
-      f"📋 *Reg No:* `{reg_no}`\n\n"
-      f"💬 *Message:*\n{user_text}\n\n"
-      f"👉 _To reply, use:_ `/send {chat_id} <your reply>`"
-  )
-
-  if ADMIN_ID:
-    try:
-      await context.bot.send_message(
-          chat_id=int(ADMIN_ID), text=admin_notification, parse_mode="Markdown"
-      )
-      await update.message.reply_text(
-          "✅ Your message has been forwarded to the instructor/admin."
-      )
-    except Exception as exc:
-      logger.error("Failed to forward to admin: %s", exc)
-      await update.message.reply_text(
-          "⚠️ Could not send your message right now. Please try again later."
-      )
-  else:
-    await update.message.reply_text("⚠️ Admin is not configured on this bot.")
 
 
-async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-  """Admin Command: /send <chat_id> <message> -> Send direct message to a student."""
-  user_id = update.effective_user.id
-  if not ADMIN_ID or str(user_id) != ADMIN_ID:
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/help — Guide and usage."""
     await update.message.reply_text(
-        "⛔ You are not authorized to use this command."
-    )
-    return
-
-  if len(context.args) < 2:
-    await update.message.reply_text(
-        "⚠️ Usage: `/send <chat_id> <your reply/message>`",
+        "🤖 *Attendance Template Validator — Help*\n\n"
+        "✨ *Features:*\n"
+        "• Paste any Google Sheets URL or document ID to validate its layout\n"
+        "• Verifies all tabs (`Sheet1`, `DSA`, `Discrete Mathematics`, etc.)\n"
+        "• Displays metrics (Student Count, Sessions tracked) if valid\n"
+        "• Lists top critical errors if invalid\n\n"
+        "📌 *Commands:*\n"
+        "• `/validate <URL>` — Validate a specific spreadsheet\n"
+        "• `/help` — Show this help message\n\n"
+        "💡 *Sharing Access:* Make sure to share your Google Sheet with **Viewer** access "
+        "to the service account email configured on the bot.",
         parse_mode="Markdown",
     )
-    return
-
-  target_chat_id = context.args[0].strip()
-  message_to_send = " ".join(context.args[1:])
-
-  try:
-    await context.bot.send_message(
-        chat_id=int(target_chat_id),
-        text=f"💬 *Message from Admin:*\n\n{message_to_send}",
-        parse_mode="Markdown",
-    )
-    await update.message.reply_text(
-        f"✅ Message sent successfully to `{target_chat_id}`.",
-        parse_mode="Markdown",
-    )
-  except Exception as exc:
-    logger.error("Failed to send message to %s: %s", target_chat_id, exc)
-    await update.message.reply_text(
-        f"❌ Failed to send message: `{exc}`", parse_mode="Markdown"
-    )
-
-
-async def cmd_broadcast(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-  """Admin Command: /broadcast <message>"""
-  user_id = update.effective_user.id
-  if not ADMIN_ID or str(user_id) != ADMIN_ID:
-    await update.message.reply_text(
-        "⛔ You are not authorized to use this command."
-    )
-    return
-
-  if not context.args:
-    await update.message.reply_text(
-        "⚠️ Usage: `/broadcast <your message text>`", parse_mode="Markdown"
-    )
-    return
-
-  message_text = " ".join(context.args)
-  chat_ids = get_all_user_chat_ids()
-
-  if not chat_ids:
-    await update.message.reply_text(
-        "⚠️ No user records found in the database."
-    )
-    return
-
-  await update.message.reply_text(
-      f"📢 Starting broadcast to {len(chat_ids)} user(s)…"
-  )
-  success_count = 0
-  fail_count = 0
-
-  for cid in chat_ids:
-    try:
-      await context.bot.send_message(
-          chat_id=cid, text=message_text, parse_mode="Markdown"
-      )
-      success_count += 1
-      await asyncio.sleep(0.05)
-    except Exception as exc:
-      logger.warning("Failed to send broadcast to %s: %s", cid, exc)
-      fail_count += 1
-
-  await update.message.reply_text(
-      f"✅ *Broadcast Complete!*\n\n"
-      f"📤 Sent: `{success_count}`\n"
-      f"❌ Failed / Blocked: `{fail_count}`",
-      parse_mode="Markdown",
-  )
-
-
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-  await update.message.reply_text(
-      "🤖 *Commands Available:*\n"
-      "• /start — Check your attendance\n"
-      "• /contact <message> — Send a question/message to Admin\n"
-      "• /cancel — Cancel current action",
-      parse_mode="Markdown",
-  )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Application Entry Point
+# 6. Application entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-  print("=" * 50, flush=True)
-  print("🚀 Starting Discrete Mathematics Attendance Bot...", flush=True)
-  print("=" * 50, flush=True)
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN / BOT_TOKEN is not set in environment.")
+        sys.exit(1)
 
-  if not BOT_TOKEN:
-    logger.critical(
-        "BOT_TOKEN is missing! Set BOT_TOKEN in Render Environment Variables."
-    )
+    # Start HTTP server for Render health checks
+    start_health_check_server()
+
+    logger.info("Starting Attendance Template Validator Bot…")
+
+    # Clean up any leftover webhooks
+    try:
+        with httpx.Client(timeout=15) as client:
+            r = client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+                json={"drop_pending_updates": True},
+            )
+            logger.info("deleteWebhook response: %s", r.json())
+    except Exception as exc:
+        logger.warning("Could not delete webhook: %s", exc)
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Commands
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("validate", cmd_validate))
+
+    # Link listener for Google Sheets URL or raw document ID
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sheet_link_listener))
+
+    logger.info("Bot is live and listening for messages...")
     sys.stdout.flush()
-    sys.exit(1)
 
-  try:
-    _ = _build_creds()
-    logger.info("Google credentials verified.")
-  except Exception as e:
-    logger.critical("Google credentials verification failed: %s", e)
-    sys.stdout.flush()
-    sys.exit(1)
-
-  # Start HTTP server for Render health checks
-  start_health_check_server()
-
-  # Clean up any leftover webhooks
-  try:
-    with httpx.Client(timeout=15) as client:
-      r = client.post(
-          f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
-          json={"drop_pending_updates": True},
-      )
-      logger.info("deleteWebhook response: %s", r.json())
-  except Exception as exc:
-    logger.warning("Could not delete webhook: %s", exc)
-
-  app = Application.builder().token(BOT_TOKEN).build()
-
-  conv = ConversationHandler(
-      entry_points=[CommandHandler("start", cmd_start)],
-      states={
-          ASK_REG_NO: [
-              MessageHandler(filters.TEXT & ~filters.COMMAND, received_reg_no)
-          ],
-          ASK_ROLL_NO: [
-              MessageHandler(filters.TEXT & ~filters.COMMAND, received_roll_no)
-          ],
-      },
-      fallbacks=[CommandHandler("cancel", cmd_cancel)],
-      allow_reentry=True,
-  )
-
-  app.add_handler(conv)
-  app.add_handler(CommandHandler("contact", cmd_contact))
-  app.add_handler(CommandHandler("send", cmd_send))
-  app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-  app.add_handler(MessageHandler(filters.COMMAND, unknown))
-
-  logger.info("Bot is live and listening for messages...")
-  sys.stdout.flush()
-
-  # Ensure an active event loop exists for Python 3.12+ / 3.14 compatibility
-  try:
-    asyncio.get_event_loop()
-  except RuntimeError:
+    # Ensure an active event loop exists for Python 3.12+ / 3.14 compatibility
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-  app.run_polling(
-      allowed_updates=Update.ALL_TYPES,
-      drop_pending_updates=True,
-  )
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
-  main()
+    main()
