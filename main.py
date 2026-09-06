@@ -4,9 +4,15 @@ main.py — Automated Google Sheet Attendance Template Validator Telegram Bot.
 Listens for Google Sheets URLs or Document IDs, fetches sheets via gspread,
 and automatically validates whether the layout, headers, and student data strictly
 conform to the expected college attendance template.
+
+When validation succeeds:
+Prompt the user for College Name, Branch Name, and Subject to be integrated,
+and forwards all details (including user's chat_id, sheet metrics, and link)
+directly to the Admin Chat on Telegram.
 """
 
 import asyncio
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import logging
@@ -23,6 +29,7 @@ from telegram import Update, constants
 from telegram.ext import (
     Application,
     CommandHandler,
+    ConversationHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -38,9 +45,10 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 GOOGLE_CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "credentials.json")
+ADMIN_ID = os.getenv("ADMIN_ID") or os.getenv("ADMIN_CHAT_ID", "")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Logging
+# 2. Logging & Conversation States
 # ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +59,9 @@ logger = logging.getLogger("sheet_validator_bot")
 
 SHEET_URL_REGEX = re.compile(r'https://docs\.google\.com/spreadsheets/d/([a-zA-Z0-9-_]+)')
 DOC_ID_REGEX = re.compile(r'^[a-zA-Z0-9-_]{25,60}$')
+
+# States for post-validation questionnaire
+ASK_COLLEGE, ASK_BRANCH, ASK_SUBJECT = range(3)
 
 
 def escape_md(text: str) -> str:
@@ -140,25 +151,22 @@ def get_gspread_client() -> Tuple[Optional[gspread.Client], Optional[str], Optio
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Sheet validation handler
+# 5. Sheet validation & integration questionnaire flow
 # ─────────────────────────────────────────────────────────────────────────────
-async def process_sheet_validation(update: Update, context: ContextTypes.DEFAULT_TYPE, doc_id: str) -> None:
+async def process_sheet_validation(update: Update, context: ContextTypes.DEFAULT_TYPE, doc_id: str) -> int:
     """
-    Fetches the spreadsheet by doc_id, iterates over all worksheets,
-    runs validate_attendance_sheet on each, and sends a formatted Markdown report.
+    Fetches spreadsheet by doc_id, runs validate_attendance_sheet,
+    and if valid, prompts user for College Name (transitioning to ASK_COLLEGE).
     """
-    # 1. Immediate acknowledgement & typing indicator
     ack_msg = await update.message.reply_text("🔍 *Validating sheet template...*", parse_mode="Markdown")
     if update.effective_chat:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=constants.ChatAction.TYPING)
 
-    # 2. Get gspread client
     client, sa_email, err_msg = get_gspread_client()
     if err_msg:
         await ack_msg.edit_text(err_msg, parse_mode="Markdown")
-        return
+        return ConversationHandler.END
 
-    # 3. Open spreadsheet
     try:
         spreadsheet = client.open_by_key(doc_id)
     except gspread.exceptions.SpreadsheetNotFound:
@@ -171,7 +179,7 @@ async def process_sheet_validation(update: Update, context: ContextTypes.DEFAULT
             "Also verify that the document link or ID is correct."
         )
         await ack_msg.edit_text(msg, parse_mode="Markdown")
-        return
+        return ConversationHandler.END
     except gspread.exceptions.APIError as api_err:
         err_str = str(api_err)
         if "PERMISSION_DENIED" in err_str or "403" in err_str or "404" in err_str:
@@ -185,22 +193,21 @@ async def process_sheet_validation(update: Update, context: ContextTypes.DEFAULT
         else:
             msg = f"❌ *Google API Error:* `{escape_md(err_str)}`"
         await ack_msg.edit_text(msg, parse_mode="Markdown")
-        return
+        return ConversationHandler.END
     except Exception as exc:
         logger.error("Error opening spreadsheet %s: %s", doc_id, exc, exc_info=True)
         await ack_msg.edit_text(f"❌ *Failed to open spreadsheet:* `{escape_md(str(exc))}`", parse_mode="Markdown")
-        return
+        return ConversationHandler.END
 
-    # 4. Fetch all worksheet tabs (e.g. Sheet1, DSA, Discrete Mathematics)
     try:
         worksheets = spreadsheet.worksheets()
     except Exception as exc:
         await ack_msg.edit_text(f"❌ *Failed to inspect sheet tabs:* `{escape_md(str(exc))}`", parse_mode="Markdown")
-        return
+        return ConversationHandler.END
 
     if not worksheets:
         await ack_msg.edit_text("❌ *The spreadsheet contains no worksheets.*", parse_mode="Markdown")
-        return
+        return ConversationHandler.END
 
     all_errors = []
     all_warnings = []
@@ -209,7 +216,6 @@ async def process_sheet_validation(update: Update, context: ContextTypes.DEFAULT
     tab_reports = []
     all_valid = True
 
-    # 5. Validate each tab
     for ws in worksheets:
         tab_title = ws.title
         res = validate_attendance_sheet(worksheet=ws)
@@ -233,25 +239,8 @@ async def process_sheet_validation(update: Update, context: ContextTypes.DEFAULT
 
     sheet_title_escaped = escape_md(spreadsheet.title)
 
-    # 6. Format Markdown response
-    if all_valid:
-        tabs_display = ", ".join([f"`{escape_md(t['title'])}`" for t in tab_reports])
-        response = (
-            "✅ *Template Verified Successfully*\n\n"
-            f"📋 *Spreadsheet:* {sheet_title_escaped}\n"
-            f"📁 *Tabs Verified:* {len(worksheets)} tab(s) ({tabs_display})\n\n"
-            f"📊 *Summary Metrics:*\n"
-            f"• *Student Count Identified:* `{total_students}`\n"
-            f"• *Sessions Tracked:* `{total_sessions}`\n"
-            f"• *Status:* Strictly conforms to expected attendance schema."
-        )
-        if all_warnings:
-            response += "\n\n⚠️ *Formatting Notes:*\n"
-            for w in all_warnings[:3]:
-                response += f"• {escape_md(w)}\n"
-            if len(all_warnings) > 3:
-                response += f"• _...and {len(all_warnings) - 3} more minor note(s)._\n"
-    else:
+    # ── If invalid: report top errors and end conversation ────────────
+    if not all_valid:
         response = (
             "❌ *Template Mismatch Found*\n\n"
             f"📋 *Spreadsheet:* {sheet_title_escaped}\n\n"
@@ -267,19 +256,172 @@ async def process_sheet_validation(update: Update, context: ContextTypes.DEFAULT
             f"\n*(Total critical errors: {len(all_errors)})*\n\n"
             "Please fix the headers, sequences, or values in your Google Sheet and send the link again."
         )
+        try:
+            await ack_msg.edit_text(response, parse_mode="Markdown")
+        except Exception:
+            plain = response.replace("*", "").replace("`", "").replace("_", "")
+            await ack_msg.edit_text(plain)
+        return ConversationHandler.END
 
+    # ── If valid: store sheet details and prompt for College Name ─────
+    context.user_data["doc_id"] = doc_id
+    context.user_data["sheet_title"] = spreadsheet.title
+    context.user_data["student_count"] = total_students
+    context.user_data["session_count"] = total_sessions
+    context.user_data["tabs"] = [t['title'] for t in tab_reports]
+
+    tabs_display = ", ".join([f"`{escape_md(t['title'])}`" for t in tab_reports])
+    success_msg = (
+        "✅ *Template Verified Successfully!*\n\n"
+        f"📋 *Spreadsheet:* {sheet_title_escaped}\n"
+        f"📁 *Tabs Verified:* {len(worksheets)} tab(s) ({tabs_display})\n"
+        f"📊 *Identified:* `{total_students}` Students | `{total_sessions}` Sessions Tracked\n"
+        "• *Status:* Strictly conforms to expected attendance schema.\n\n"
+        "🎉 *Now let's submit this sheet for integration!*\n"
+        "Please provide the following information to forward to the Admin:\n\n"
+        "🏛️ *Step 1 of 3:* Please enter your *College Name*:\n"
+        "_(Type /cancel anytime to exit)_"
+    )
     try:
-        await ack_msg.edit_text(response, parse_mode="Markdown")
-    except Exception as send_err:
-        logger.warning("Markdown formatting rejected (%s). Sending plain text fallback.", send_err)
-        plain = response.replace("*", "").replace("`", "").replace("_", "")
+        await ack_msg.edit_text(success_msg, parse_mode="Markdown")
+    except Exception:
+        plain = success_msg.replace("*", "").replace("`", "").replace("_", "")
         await ack_msg.edit_text(plain)
 
+    return ASK_COLLEGE
 
-async def sheet_link_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+async def received_college(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles College Name input and prompts for Branch Name."""
+    college = update.message.text.strip()
+    if not college:
+        await update.message.reply_text("⚠️ College name cannot be empty. Please enter your college name:")
+        return ASK_COLLEGE
+
+    context.user_data["college_name"] = college
+    await update.message.reply_text(
+        f"🏛️ *College:* {escape_md(college)}\n\n"
+        "🏢 *Step 2 of 3:* Please enter your *Branch Name* (e.g. `CSE`, `ECE`, `Civil Engineering`):",
+        parse_mode="Markdown",
+    )
+    return ASK_BRANCH
+
+
+async def received_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles Branch Name input and prompts for Subject Name."""
+    branch = update.message.text.strip()
+    if not branch:
+        await update.message.reply_text("⚠️ Branch name cannot be empty. Please enter your branch name:")
+        return ASK_BRANCH
+
+    context.user_data["branch_name"] = branch
+    await update.message.reply_text(
+        f"🏢 *Branch:* {escape_md(branch)}\n\n"
+        "📚 *Step 3 of 3:* Please enter the *Subject to be integrated* (e.g. `Discrete Mathematics`, `DSA`):",
+        parse_mode="Markdown",
+    )
+    return ASK_SUBJECT
+
+
+async def received_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Handles Subject Name input, aggregates all collected data and chat_id,
+    and forwards everything directly to the Admin Chat on Telegram.
+    """
+    subject = update.message.text.strip()
+    if not subject:
+        await update.message.reply_text("⚠️ Subject name cannot be empty. Please enter the subject name:")
+        return ASK_SUBJECT
+
+    context.user_data["subject_name"] = subject
+
+    # Extract all information
+    college = context.user_data.get("college_name", "N/A")
+    branch = context.user_data.get("branch_name", "N/A")
+    doc_id = context.user_data.get("doc_id", "N/A")
+    sheet_title = context.user_data.get("sheet_title", "N/A")
+    student_count = context.user_data.get("student_count", 0)
+    session_count = context.user_data.get("session_count", 0)
+    tabs = context.user_data.get("tabs", [])
+
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    user_handle = f"@{user.username}" if user and user.username else "No username"
+    full_name = user.full_name if user else "Unknown User"
+    current_time = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{doc_id}/edit"
+
+    # 1. Forward directly to the Admin Chat
+    admin_id_val = os.getenv("ADMIN_ID") or os.getenv("ADMIN_CHAT_ID", "")
+    admin_sent = False
+
+    admin_notification = (
+        "🚀 *New Sheet Integration Request Received!*\n"
+        "──────────────────────────────\n"
+        f"🏛️ *College:* {escape_md(college)}\n"
+        f"🏢 *Branch:* {escape_md(branch)}\n"
+        f"📚 *Subject to be Integrated:* {escape_md(subject)}\n\n"
+        f"📋 *Spreadsheet Title:* {escape_md(sheet_title)}\n"
+        f"📁 *Tabs:* {escape_md(', '.join(tabs))}\n"
+        f"🔗 *Google Sheet Link:* [Open in Google Sheets]({sheet_url})\n"
+        f"🆔 *Document ID:* `{doc_id}`\n\n"
+        f"📊 *Verified Metrics:*\n"
+        f"• *Students Identified:* `{student_count}`\n"
+        f"• *Sessions Tracked:* `{session_count}`\n\n"
+        f"👤 *Submitted By:*\n"
+        f"• *Name:* {escape_md(full_name)}\n"
+        f"• *Handle:* {escape_md(user_handle)}\n"
+        f"• *User Chat ID:* `{chat_id}`\n"
+        f"⏰ *Timestamp:* `{current_time}`\n"
+        "──────────────────────────────\n"
+        f"👉 _To reply directly to this user, send:_\n"
+        f"`/send {chat_id} <your message>`"
+    )
+
+    if admin_id_val:
+        try:
+            await context.bot.send_message(
+                chat_id=int(admin_id_val.strip()),
+                text=admin_notification,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+            admin_sent = True
+            logger.info("Successfully forwarded integration request to admin %s", admin_id_val)
+        except Exception as exc:
+            logger.error("Failed to forward integration request to admin %s: %s", admin_id_val, exc)
+
+    # 2. Confirmation back to the user
+    user_confirmation = (
+        "🎉 *Integration Request Submitted Successfully!*\n\n"
+        "Your verified sheet layout and curriculum details have been forwarded directly to the administrator.\n\n"
+        "📋 *Summary of Submission:*\n"
+        f"• *College:* {escape_md(college)}\n"
+        f"• *Branch:* {escape_md(branch)}\n"
+        f"• *Subject:* {escape_md(subject)}\n"
+        f"• *Sheet:* {escape_md(sheet_title)}\n"
+        f"• *Total Students:* `{student_count}`\n"
+        f"• *Your Chat ID:* `{chat_id}`\n\n"
+    )
+    if admin_sent:
+        user_confirmation += "✅ *Delivery Status:* Successfully notified the Admin.\n"
+    else:
+        user_confirmation += (
+            "⚠️ *Note:* `ADMIN_ID` is not yet configured in `.env`. "
+            "Please ask the administrator to set their Telegram Chat ID.\n"
+        )
+    user_confirmation += "\nYou will receive updates here once your subject is integrated!"
+
+    await update.message.reply_text(user_confirmation, parse_mode="Markdown")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def sheet_link_listener(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Detects Google Sheets links or document IDs in incoming messages."""
     if not update.message or not update.message.text:
-        return
+        return ConversationHandler.END
 
     text = update.message.text.strip()
 
@@ -287,16 +429,16 @@ async def sheet_link_listener(update: Update, context: ContextTypes.DEFAULT_TYPE
     url_match = SHEET_URL_REGEX.search(text)
     if url_match:
         doc_id = url_match.group(1)
-        await process_sheet_validation(update, context, doc_id)
-        return
+        return await process_sheet_validation(update, context, doc_id)
 
     # Match standalone Document ID
     if DOC_ID_REGEX.match(text) and not text.startswith("/"):
-        await process_sheet_validation(update, context, text)
-        return
+        return await process_sheet_validation(update, context, text)
+
+    return ConversationHandler.END
 
 
-async def cmd_validate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_validate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Command handler: /validate <url_or_id>"""
     if not context.args:
         await update.message.reply_text(
@@ -307,27 +449,80 @@ async def cmd_validate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "`/validate <Google_Sheet_URL_or_ID>`",
             parse_mode="Markdown",
         )
-        return
+        return ConversationHandler.END
 
     arg = context.args[0].strip()
     url_match = SHEET_URL_REGEX.search(arg)
     doc_id = url_match.group(1) if url_match else arg
-    await process_sheet_validation(update, context, doc_id)
+    return await process_sheet_validation(update, context, doc_id)
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancels the ongoing integration questionnaire."""
+    context.user_data.clear()
+    await update.message.reply_text("🚫 Integration request cancelled. You can send a new Google Sheets link anytime.")
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Admin & Utility Commands
+# ─────────────────────────────────────────────────────────────────────────────
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shows the current chat ID for configuration in .env."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    await update.message.reply_text(
+        f"🆔 *Telegram Chat ID Details*\n"
+        f"• *Chat ID:* `{chat_id}`\n"
+        f"• *Name:* {escape_md(user.full_name if user else 'N/A')}\n\n"
+        "💡 *If you are the Admin:*\n"
+        "Add this Chat ID to your `.env` file:\n"
+        f"`ADMIN_ID={chat_id}`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /send <chat_id> <message> to reply directly to a user."""
+    admin_id_val = os.getenv("ADMIN_ID") or os.getenv("ADMIN_CHAT_ID", "")
+    sender_id = str(update.effective_user.id)
+
+    if not admin_id_val or sender_id != admin_id_val.strip():
+        await update.message.reply_text("⛔ You are not authorized to use this admin command.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("⚠️ Usage: `/send <chat_id> <message>`", parse_mode="Markdown")
+        return
+
+    target_chat_id = context.args[0]
+    message_text = " ".join(context.args[1:])
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(target_chat_id),
+            text=f"💬 *Message from Admin:*\n\n{message_text}",
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text(f"✅ Message delivered to `{target_chat_id}`.", parse_mode="Markdown")
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Failed to send message: `{escape_md(str(exc))}`", parse_mode="Markdown")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/start — Greeting and instructions."""
     await update.message.reply_text(
-        "👋 *Welcome to the Attendance Template Validator Bot!*\n\n"
-        "📊 *How to validate a Google Sheet:*\n"
-        "Just paste any Google Sheets link directly into this chat, or use:\n"
-        "`/validate <Google_Sheet_URL>`\n\n"
-        "The bot will automatically check:\n"
-        "• Required headers in exact sequence (`['S.NO', 'Roll NO', 'Reg.NO', 'Student Name', 'Present', 'Absent', 'Percentage']`)\n"
-        "• Date session columns (`DD/MM/YYYY`)\n"
-        "• Incremental S.NO & 11-digit Reg.NO\n"
-        "• Valid attendance marks (`P`, `A`, or blank)\n\n"
-        "Type /help for more information.",
+        "👋 *Welcome to the Attendance Template Validator & Integration Bot!*\n\n"
+        "📊 *How it works:*\n"
+        "1. Paste your Google Sheets link directly in this chat.\n"
+        "2. The bot verifies the attendance template syntax.\n"
+        "3. Upon successful validation, it collects your **College**, **Branch**, and **Subject**.\n"
+        "4. Everything is forwarded directly to the Admin for integration!\n\n"
+        "📌 *Helpful Commands:*\n"
+        "• `/validate <URL>` — Validate a specific spreadsheet\n"
+        "• `/id` — Check your Telegram Chat ID\n"
+        "• `/cancel` — Cancel an ongoing submission\n"
+        "• `/help` — View full instructions",
         parse_mode="Markdown",
     )
 
@@ -337,33 +532,32 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🤖 *Attendance Template Validator — Help*\n\n"
         "✨ *Features:*\n"
-        "• Paste any Google Sheets URL or document ID to validate its layout\n"
-        "• Verifies all tabs (`Sheet1`, `DSA`, `Discrete Mathematics`, etc.)\n"
-        "• Displays metrics (Student Count, Sessions tracked) if valid\n"
-        "• Lists top critical errors if invalid\n\n"
+        "• Automatically validates attendance sheet layout (Base columns in Row 6, marks P/A/blank)\n"
+        "• Prompts for College Name, Branch, and Subject after successful verification\n"
+        "• Forwards the complete submission package to the Admin Chat with user's Chat ID\n\n"
         "📌 *Commands:*\n"
         "• `/validate <URL>` — Validate a specific spreadsheet\n"
-        "• `/help` — Show this help message\n\n"
-        "💡 *Sharing Access:* Make sure to share your Google Sheet with **Viewer** access "
+        "• `/id` — Show your Chat ID\n"
+        "• `/cancel` — Cancel active prompt\n"
+        "• `/help` — Show this message\n\n"
+        "💡 *Sharing Access:* Share your Google Sheet with **Viewer** access "
         "to the service account email configured on the bot.",
         parse_mode="Markdown",
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Application entry point
+# 7. Application entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN / BOT_TOKEN is not set in environment.")
         sys.exit(1)
 
-    # Start HTTP server for Render health checks
     start_health_check_server()
 
     logger.info("Starting Attendance Template Validator Bot…")
 
-    # Clean up any leftover webhooks
     try:
         with httpx.Client(timeout=15) as client:
             r = client.post(
@@ -376,18 +570,31 @@ def main() -> None:
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Commands
+    # Conversation handler for sheet validation + metadata collection
+    integration_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.TEXT & ~filters.COMMAND, sheet_link_listener),
+            CommandHandler("validate", cmd_validate),
+        ],
+        states={
+            ASK_COLLEGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_college)],
+            ASK_BRANCH:  [MessageHandler(filters.TEXT & ~filters.COMMAND, received_branch)],
+            ASK_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_subject)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        allow_reentry=True,
+    )
+
+    app.add_handler(integration_conv)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("validate", cmd_validate))
-
-    # Link listener for Google Sheets URL or raw document ID
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sheet_link_listener))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("myid", cmd_id))
+    app.add_handler(CommandHandler("send", cmd_send))
 
     logger.info("Bot is live and listening for messages...")
     sys.stdout.flush()
 
-    # Ensure an active event loop exists for Python 3.12+ / 3.14 compatibility
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
