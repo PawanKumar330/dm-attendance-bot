@@ -6,7 +6,7 @@ and automatically validates whether the layout, headers, and student data strict
 conform to the expected college attendance template.
 
 When validation succeeds:
-Prompt the user for College Name, Branch Name, and Subject to be integrated,
+Prompts the user for College Name, Branch Name, and Subject to be integrated,
 and forwards all details (including user's chat_id, sheet metrics, and link)
 directly to the Admin Chat on Telegram.
 """
@@ -67,6 +67,16 @@ ASK_COLLEGE, ASK_BRANCH, ASK_SUBJECT = range(3)
 def escape_md(text: str) -> str:
     """Escape markdown special characters for Telegram legacy Markdown."""
     return re.sub(r'([_*`\[\]])', r'\\\1', str(text))
+
+
+async def safe_reply_markdown(update: Update, text: str) -> None:
+    """Send markdown message with automatic fallback to plain text if parsing fails."""
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as err:
+        logger.warning("Markdown formatting rejected (%s). Falling back to plain text.", err)
+        plain = text.replace("*", "").replace("`", "").replace("_", "")
+        await update.message.reply_text(plain)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,38 +298,43 @@ async def process_sheet_validation(update: Update, context: ContextTypes.DEFAULT
         plain = success_msg.replace("*", "").replace("`", "").replace("_", "")
         await ack_msg.edit_text(plain)
 
+    logger.info("Sheet validated successfully. Moving user %s to ASK_COLLEGE state.", update.effective_user.id)
     return ASK_COLLEGE
 
 
 async def received_college(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handles College Name input and prompts for Branch Name."""
     college = update.message.text.strip()
+    logger.info("received_college called with input: %s", college)
+
     if not college:
         await update.message.reply_text("⚠️ College name cannot be empty. Please enter your college name:")
         return ASK_COLLEGE
 
     context.user_data["college_name"] = college
-    await update.message.reply_text(
+    msg = (
         f"🏛️ *College:* {escape_md(college)}\n\n"
-        "🏢 *Step 2 of 3:* Please enter your *Branch Name* (e.g. `CSE`, `ECE`, `Civil Engineering`):",
-        parse_mode="Markdown",
+        "🏢 *Step 2 of 3:* Please enter your *Branch Name* (e.g. `CSE`, `ECE`, `Civil Engineering`):"
     )
+    await safe_reply_markdown(update, msg)
     return ASK_BRANCH
 
 
 async def received_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handles Branch Name input and prompts for Subject Name."""
     branch = update.message.text.strip()
+    logger.info("received_branch called with input: %s", branch)
+
     if not branch:
         await update.message.reply_text("⚠️ Branch name cannot be empty. Please enter your branch name:")
         return ASK_BRANCH
 
     context.user_data["branch_name"] = branch
-    await update.message.reply_text(
+    msg = (
         f"🏢 *Branch:* {escape_md(branch)}\n\n"
-        "📚 *Step 3 of 3:* Please enter the *Subject to be integrated* (e.g. `Discrete Mathematics`, `DSA`):",
-        parse_mode="Markdown",
+        "📚 *Step 3 of 3:* Please enter the *Subject to be integrated* (e.g. `Discrete Mathematics`, `DSA`):"
     )
+    await safe_reply_markdown(update, msg)
     return ASK_SUBJECT
 
 
@@ -329,6 +344,8 @@ async def received_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     and forwards everything directly to the Admin Chat on Telegram.
     """
     subject = update.message.text.strip()
+    logger.info("received_subject called with input: %s", subject)
+
     if not subject:
         await update.message.reply_text("⚠️ Subject name cannot be empty. Please enter the subject name:")
         return ASK_SUBJECT
@@ -412,7 +429,7 @@ async def received_subject(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     user_confirmation += "\nYou will receive updates here once your subject is integrated!"
 
-    await update.message.reply_text(user_confirmation, parse_mode="Markdown")
+    await safe_reply_markdown(update, user_confirmation)
 
     context.user_data.clear()
     return ConversationHandler.END
@@ -462,6 +479,17 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text("🚫 Integration request cancelled. You can send a new Google Sheets link anytime.")
     return ConversationHandler.END
+
+
+async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fallback handler for text messages outside an active conversation."""
+    if not update.message or not update.message.text:
+        return
+    await update.message.reply_text(
+        "👋 Paste a Google Sheets link to validate your attendance template.\n"
+        "Type /help for instructions or /id to view your Chat ID.",
+        parse_mode="Markdown",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -570,10 +598,13 @@ def main() -> None:
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Filter specifically matching sheet links so regular text goes to questionnaire states
+    sheet_link_filter = (filters.Regex(SHEET_URL_REGEX) | filters.Regex(DOC_ID_REGEX)) & ~filters.COMMAND
+
     # Conversation handler for sheet validation + metadata collection
     integration_conv = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.TEXT & ~filters.COMMAND, sheet_link_listener),
+            MessageHandler(sheet_link_filter, sheet_link_listener),
             CommandHandler("validate", cmd_validate),
         ],
         states={
@@ -582,7 +613,7 @@ def main() -> None:
             ASK_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_subject)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True,
+        allow_reentry=False,
     )
 
     app.add_handler(integration_conv)
@@ -591,6 +622,7 @@ def main() -> None:
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("myid", cmd_id))
     app.add_handler(CommandHandler("send", cmd_send))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
 
     logger.info("Bot is live and listening for messages...")
     sys.stdout.flush()
