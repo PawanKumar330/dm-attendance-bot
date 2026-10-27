@@ -1,4 +1,4 @@
-"""main.py — Discrete Mathematics Attendance Telegram Bot
+"""main.py — Discrete Mathematics Broadcast & Announcement Bot
 
 ======================================================
 Secure dual Google Sheets architecture:
@@ -338,15 +338,60 @@ def _col_letter(col: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Telegram Conversation & Custom Handlers
 # ─────────────────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+  """Shows the user's Chat ID."""
+  user = update.effective_user
+  chat_id = update.effective_chat.id
   await update.message.reply_text(
-      "👋 *Welcome to the Discrete Mathematics Attendance Bot!*\n\n"
-      "I will tell you your attendance percentage and BEU attendance marks.\n\n"
-      "📋 Please enter your *Registration Number:*\n"
-      "_Example: 25151113001_",
+      f"🆔 *Your Telegram Chat ID:* `{chat_id}`\n"
+      f"👤 *Name:* {user.full_name}\n"
+      f"📱 *Username:* @{user.username or 'N/A'}",
       parse_mode="Markdown",
   )
-  return ASK_REG_NO
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+  """Handles /start: registers user for broadcasts and notifies attendance checking is closed."""
+  user = update.effective_user
+  chat_id = update.effective_chat.id
+  username = user.username or ""
+  full_name = user.full_name or ""
+
+  # Register subscriber for broadcasts
+  save_user_record(chat_id, username, "Broadcast Subscriber", full_name)
+
+  notice = (
+      "📢 *Discrete Mathematics — Announcement Bot*\n"
+      "──────────────────────────────\n"
+      "⚠️ *Attendance checking is currently closed.*\n\n"
+      "This bot will now be used exclusively for **official announcements, class notices, and broadcasts**.\n\n"
+      "✅ *You are subscribed!* Any upcoming updates or notices will be delivered directly here.\n"
+      "──────────────────────────────\n"
+      "• Need to contact the instructor? Use:\n"
+      "  `/contact <your message>`"
+  )
+  await update.message.reply_text(notice, parse_mode="Markdown")
+
+
+async def handle_text_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+  """Handles general incoming messages."""
+  user = update.effective_user
+  chat_id = update.effective_chat.id
+  username = user.username or ""
+  full_name = user.full_name or ""
+
+  save_user_record(chat_id, username, "Broadcast Subscriber", full_name)
+
+  await update.message.reply_text(
+      "📢 *Notice:* Attendance checking is currently closed.\n\n"
+      "This bot is now used for **official announcements and broadcasts**.\n"
+      "You will receive notices here as soon as they are published.\n\n"
+      "👉 To send a message to the admin, use:\n"
+      "`/contact <your message>`",
+      parse_mode="Markdown",
+  )
 
 
 async def received_reg_no(
@@ -647,10 +692,11 @@ async def cmd_broadcast(
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
   await update.message.reply_text(
-      "🤖 *Commands Available:*\n"
-      "• /start — Check your attendance\n"
-      "• /contact <message> — Send a question/message to Admin\n"
-      "• /cancel — Cancel current action",
+      "🤖 *Discrete Mathematics Broadcast Bot*\n\n"
+      "• /start — Welcome & subscription status\n"
+      "• /contact <message> — Send a message to the admin\n"
+      "• /id — View your Telegram Chat ID\n\n"
+      "📢 *Notice:* Attendance checking is closed. This bot will be used for broadcasts.",
       parse_mode="Markdown",
   )
 
@@ -694,24 +740,13 @@ def main() -> None:
 
   app = Application.builder().token(BOT_TOKEN).build()
 
-  conv = ConversationHandler(
-      entry_points=[CommandHandler("start", cmd_start)],
-      states={
-          ASK_REG_NO: [
-              MessageHandler(filters.TEXT & ~filters.COMMAND, received_reg_no)
-          ],
-          ASK_ROLL_NO: [
-              MessageHandler(filters.TEXT & ~filters.COMMAND, received_roll_no)
-          ],
-      },
-      fallbacks=[CommandHandler("cancel", cmd_cancel)],
-      allow_reentry=True,
-  )
-
-  app.add_handler(conv)
+  app.add_handler(CommandHandler("start", cmd_start))
+  app.add_handler(CommandHandler("id", cmd_id))
+  app.add_handler(CommandHandler("myid", cmd_id))
   app.add_handler(CommandHandler("contact", cmd_contact))
   app.add_handler(CommandHandler("send", cmd_send))
   app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+  app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
   app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
   logger.info("Bot is live and listening for messages...")
